@@ -1,0 +1,192 @@
+// Rune vendor override replicating the `sushy` vendor, a target for OpenStack's sushy
+// Redfish emulator. Only the methods below differ, the rest falls back to standard.
+
+// sushy has no BIOS profile to apply, nothing to set up, no job.
+pub async fn machine_setup(ctx) {
+    None
+}
+
+// sushy has no BIOS profile, treat as already set up.
+pub async fn is_bios_setup(ctx) {
+    true
+}
+
+// True only when the system already targets network boot, either value as sushy
+// stores UefiHttp as Pxe. A bare true would skip set_boot_order_dpu_first.
+pub async fn is_boot_order_setup(ctx) {
+    let resp = ctx.get(`Systems/${ctx.system_id()}`).await?;
+    let target = match resp["body"].get("Boot") {
+        Some(boot) => match boot.get("BootSourceOverrideTarget") {
+            Some(t) => if t is String { t } else { "" },
+            None => "",
+        },
+        None => "",
+    };
+    target == "UefiHttp" || target == "Pxe"
+}
+
+// The sushy emulator has no NTP backend, so accept and no op.
+pub async fn set_ntp_servers(ctx, servers) {
+    ()
+}
+
+// Vanilla sushy 404s UpdateService/FirmwareInventory, so return empty directly.
+pub async fn get_software_inventories(ctx) {
+    []
+}
+
+// Vanilla sushy's System has no SerialNumber, so synthesize one from UUID when blank,
+// same derivation as our sushy tools patch, hyphens stripped and uppercased.
+pub async fn get_system(ctx) {
+    let resp = ctx.get(`Systems/${ctx.system_id()}`).await?;
+    let system = resp["body"];
+    let blank = match system.get("SerialNumber") {
+        Some(sn) => if sn is String { sn.trim().is_empty() } else { true },
+        None => true,
+    };
+    if blank {
+        system["SerialNumber"] = system["UUID"].replace("-", "").to_uppercase();
+    }
+    system
+}
+
+// Vanilla sushy ignores $expand, so Collection Members stay shallow refs. Instead
+// ctx.expand_collection fetches each member individually, client side.
+
+pub async fn get_accounts(ctx) {
+    let collection = ctx.expand_collection("AccountService/Accounts").await?;
+    collection["Members"]
+}
+
+pub async fn get_component_integrities(ctx) {
+    ctx.expand_collection("ComponentIntegrity").await
+}
+
+// Same filter and sort as the standard implementation. Vanilla sushy 404s
+// PCIeDevices on every chassis, and an error here is fatal, so yield empty.
+pub async fn pcie_devices(ctx) {
+    let collection = match ctx.expand_collection(`Chassis/${ctx.system_id()}/PCIeDevices`).await {
+        Ok(c) => c,
+        Err(_) => return [],
+    };
+    let devices = collection["Members"]
+        .iter()
+        .filter(|d| {
+            match d.get("Id") { Some(v) => v is String, None => false }
+                && match d.get("Manufacturer") { Some(v) => v is String, None => false }
+                && match d.get("Status") {
+                    Some(status) => match status.get("State") {
+                        Some(v) => if v is String { v.to_lowercase().contains("enabled") } else { false },
+                        None => false,
+                    },
+                    None => false,
+                }
+        })
+        .collect::<Vec>();
+    devices.sort_by(|a, b| a["Manufacturer"].cmp(b["Manufacturer"]));
+    devices
+}
+
+// Storage members need expanding too, then each Drive ref is fetched individually,
+// skipping USB, the same two step fetch the standard implementation does.
+pub async fn get_drives_metrics(ctx) {
+    let storage = ctx.expand_collection(`Systems/${ctx.system_id()}/Storage`).await?;
+    let drives = [];
+    for entry in storage["Members"] {
+        match entry.get("Drives") {
+            Some(refs) => {
+                for d in refs {
+                    let path = d["@odata.id"].replace("/redfish/v1/", "");
+                    if path.contains("USB") {
+                        continue;
+                    }
+                    let resp = ctx.get(path).await?;
+                    drives.push(resp["body"]);
+                }
+            }
+            None => {}
+        }
+    }
+    drives
+}
+
+// Any other direct get_collection(id) call also gets the adaptive expand or
+// fallback behavior, not just the methods above.
+pub async fn get_collection(ctx, id) {
+    ctx.expand_collection(id).await
+}
+
+// Patches the system `Boot` object. `mode`/`http_boot_uri` are omitted when absent.
+pub async fn set_boot_override(ctx, target, enabled, mode, http_boot_uri) {
+    let boot = #{
+        "BootSourceOverrideTarget": target,
+        "BootSourceOverrideEnabled": enabled,
+    };
+    if let Some(m) = mode {
+        boot["BootSourceOverrideMode"] = m;
+    }
+    if let Some(uri) = http_boot_uri {
+        boot["HttpBootUri"] = uri;
+    }
+    ctx.patch(`Systems/${ctx.system_id()}`, #{ "Boot": boot }).await?;
+    None
+}
+
+pub async fn boot_once(ctx, target) {
+    set_boot_override(ctx, target, "Once", None, None).await
+}
+
+pub async fn boot_first(ctx, target) {
+    set_boot_override(ctx, target, "Continuous", None, None).await
+}
+
+// sushy has no DPU, "boot order" means network boot. Try UefiHttp, fall back to Pxe.
+pub async fn set_boot_order_dpu_first(ctx) {
+    if let Err(_) = boot_first(ctx, "UefiHttp").await {
+        boot_first(ctx, "Pxe").await?;
+    }
+    None
+}
+
+// Vanilla sushy has no BootOptions endpoint at all and 404s. Our patched sushy adds
+// an always empty one, so return that shape rather than hitting the network.
+pub async fn get_boot_options(ctx) {
+    #{
+        "@odata.type": "#BootOptionCollection.BootOptionCollection",
+        "@odata.id": `/redfish/v1/Systems/${ctx.system_id()}/BootOptions`,
+        "Name": "Boot Options",
+        "Members": [],
+    }
+}
+
+// Vanilla sushy's EthernetInterface has no UefiDevicePath, which site explorer reads
+// for its primary NIC pick. ctx.vendor_data() carries a MAC to path table instead.
+pub async fn get_system_ethernet_interface(ctx, id) {
+    let resp = ctx.get(`Systems/${ctx.system_id()}/EthernetInterfaces/${id}`).await?;
+    let iface = resp["body"];
+    let has_path = match iface.get("UefiDevicePath") {
+        Some(v) => if v is String { !v.trim().is_empty() } else { true },
+        None => false,
+    };
+    if !has_path {
+        let mac = match iface.get("MACAddress") {
+            Some(v) => if v is String { v.to_lowercase() } else { "" },
+            None => "",
+        };
+        if !mac.is_empty() {
+            match ctx.vendor_data() {
+                Some(data) => match data.get("uefi_device_path_by_mac") {
+                    Some(lookup) => match lookup.get(mac) {
+                        Some(path) => {
+                            iface["UefiDevicePath"] = path;
+                        }
+                        None => {}
+                    },
+                    None => {}
+                },
+                None => {}
+            }
+        }
+    }
+    iface
+}

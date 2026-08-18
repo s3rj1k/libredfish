@@ -38,6 +38,10 @@ pub struct ServiceRoot {
     pub product: Option<String>,
     pub redfish_version: String,
     pub vendor: Option<String>,
+    /// Vendor forced by the override file, set in `get_service_root` and returned by
+    /// `vendor()` ahead of auto detection. Not part of the Redfish schema.
+    #[serde(skip)]
+    pub override_vendor: Option<RedfishVendor>,
     #[serde(rename = "UUID")]
     pub uuid: Option<String>,
     pub oem: Option<HashMap<String, serde_json::Value>>,
@@ -74,6 +78,7 @@ pub enum RedfishVendor {
     P3809, // dummy for P3809, needs to be set to NvidiaGH200 or NvidiaGBSwitch based on chassis
     LiteOnPowerShelf,
     DeltaPowerShelf,
+    Rune,
     Unknown,
 }
 
@@ -94,7 +99,9 @@ impl ServiceRoot {
         })
     }
 
-    pub fn vendor(&self) -> Option<RedfishVendor> {
+    /// The vendor the BMC itself reports, ignoring any override file. Use it for
+    /// hardware quirks that must follow the real hardware, not a forced vendor.
+    pub fn detected_vendor(&self) -> Option<RedfishVendor> {
         let v = self.vendor_string().unwrap_or("Unknown".to_string());
         Some(match v.to_lowercase().as_str() {
             "ami" => RedfishVendor::AMI,
@@ -120,8 +127,14 @@ impl ServiceRoot {
             },
             "lite-on technology corp." => RedfishVendor::LiteOnPowerShelf,
             "delta electronics inc." => RedfishVendor::DeltaPowerShelf,
+            "rune" => RedfishVendor::Rune,
             _ => RedfishVendor::Unknown,
         })
+    }
+
+    pub fn vendor(&self) -> Option<RedfishVendor> {
+        // A forced override vendor wins over auto detection.
+        self.override_vendor.or_else(|| self.detected_vendor())
     }
 
     /// Vera Rubin compute-tray host BMC.
@@ -209,5 +222,17 @@ mod test {
             ..Default::default()
         };
         assert_eq!(result.vendor().unwrap(), RedfishVendor::DeltaPowerShelf);
+    }
+
+    #[test]
+    fn override_vendor_wins_over_detection() {
+        // A pinned override vendor, stamped by get_service_root, takes precedence
+        // over whatever the BMC itself reports.
+        let result = ServiceRoot {
+            vendor: Some("dell".to_string()),
+            override_vendor: Some(RedfishVendor::Rune),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::Rune);
     }
 }

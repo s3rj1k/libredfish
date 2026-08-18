@@ -31,8 +31,9 @@ use reqwest::{
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, Instrument};
 
-use crate::model::service_root::RedfishVendor;
+use crate::model::service_root::{RedfishVendor, ServiceRoot};
 use crate::model::ComputerSystem;
+use crate::vendor_override::VendorOverride;
 use crate::{model::InvalidValueError, standard::RedfishStandard, Redfish, RedfishError};
 
 pub const REDFISH_ENDPOINT: &str = "redfish/v1";
@@ -169,11 +170,8 @@ impl RedfishClientPool {
             .await
     }
 
-    /// Creates a Redfish BMC client for a certain endpoint using
-    /// the provided vendor instead of auto-detecting from the service
-    /// root. This is needed for BMCs (e.g. Lite-On power shelves) whose
-    /// service root does not expose vendor information, where we need
-    /// a client that uses vendor-specific logic.
+    /// Creates a client with the given vendor instead of detecting one, for BMCs whose
+    /// service root exposes no vendor. A matching override entry still wins over it.
     pub async fn create_client_with_vendor(
         &self,
         endpoint: Endpoint,
@@ -199,16 +197,7 @@ impl RedfishClientPool {
     ) -> Result<Box<dyn crate::Redfish>, RedfishError> {
         let client = RedfishHttpClient::new(self.http_client.clone(), endpoint, custom_headers);
         let mut s = RedfishStandard::new(client);
-        let service_root = s.get_service_root().await?;
-
-        // Resolve the vendor up-front (explicit override, else from the service
-        // root, which get_service_root backfills from the chassis manufacturer
-        // for vendorless power shelves). Knowing the vendor here lets us skip
-        // resource lookups for platforms that don't expose them.
-        let vendor = match vendor {
-            Some(v) => v,
-            None => service_root.vendor().ok_or(RedfishError::MissingVendor)?,
-        };
+        let mut service_root = s.get_service_root().await?;
 
         let managers = s.get_managers().await?;
         let mut manager_id = managers
@@ -217,6 +206,12 @@ impl RedfishClientPool {
                 error: "No managers found in service root".to_string(),
             })?
             .clone();
+
+        // Resolve the vendor up front, knowing it here lets us skip resource lookups
+        // that some platforms do not expose.
+        let (ov, vendor) =
+            Self::resolve_vendor(s.client.host(), &manager_id, vendor, &service_root).await?;
+
         let chassis = s.get_chassis_all().await?;
 
         // Delta power shelves expose no `/Systems` resource (a real query 404s)
@@ -255,13 +250,7 @@ impl RedfishClientPool {
                     break;
                 }
             }
-            let manager_from_system = system_with_bios
-                .as_ref()
-                .and_then(|swb| swb.links.as_ref())
-                .and_then(|links| links.managed_by.as_ref())
-                .and_then(|mb| mb.first())
-                .and_then(|d| d.odata_id.trim_matches('/').split('/').next_back())
-                .map(|m| m.to_string());
+            let manager_from_system = system_with_bios.as_ref().and_then(manager_id_from_system);
             manager_id = manager_from_system.unwrap_or(manager_id);
 
             let system_id = system_with_bios
@@ -273,6 +262,12 @@ impl RedfishClientPool {
         }
 
         s.set_manager_id(&manager_id)?;
+
+        // Hand the override file its last word, now that the manager id settled.
+        let forced =
+            Self::apply_override(&mut s, &mut service_root, ov, &managers, &manager_id).await?;
+        let vendor = forced.unwrap_or(vendor);
+
         s.set_service_root(service_root.clone())?;
 
         // Resolve placeholder/ambiguous vendors that can only be settled from
@@ -282,6 +277,7 @@ impl RedfishClientPool {
         // - AMI is shared by Viking/DGX/GB300, distinguished by inspecting the
         //   host systems (see `refine_ami_vendor`).
         let vendor = match vendor {
+            _ if !Self::needs_refinement(forced, vendor) => vendor,
             RedfishVendor::P3809 => {
                 if chassis.contains(&"MGX_NVSwitch_0".to_string()) {
                     RedfishVendor::NvidiaGBSwitch
@@ -294,6 +290,70 @@ impl RedfishClientPool {
         };
 
         s.set_vendor(vendor).await
+    }
+
+    /// Look up the vendor override for this endpoint and pick the vendor to build
+    /// with. Keyed by host plus manager id.
+    async fn resolve_vendor(
+        host: &str,
+        manager_id: &str,
+        caller: Option<RedfishVendor>,
+        service_root: &ServiceRoot,
+    ) -> Result<(Option<VendorOverride>, RedfishVendor), RedfishError> {
+        let ov = crate::vendor_override::resolve(host, manager_id).await?;
+        let vendor =
+            Self::pick_vendor(ov.as_ref().map(|o| o.vendor), caller, service_root.vendor())?;
+        Ok((ov, vendor))
+    }
+
+    /// Give the override file the last word once the manager id settled, returning
+    /// the vendor it forces, if any.
+    async fn apply_override(
+        s: &mut RedfishStandard,
+        service_root: &mut ServiceRoot,
+        ov: Option<VendorOverride>,
+        managers: &[String],
+        manager_id: &str,
+    ) -> Result<Option<RedfishVendor>, RedfishError> {
+        let host = s.client.host().to_string();
+        // The systems walk can move the manager id, which is part of the lookup key,
+        // so an entry naming it only matches this second lookup.
+        let ov = match managers.first().map(String::as_str) {
+            // Upgrade only, `select` falls back to the address only entry, so a miss
+            // here leaves the earlier hit standing.
+            Some(first) if first != manager_id => {
+                crate::vendor_override::resolve(&host, manager_id)
+                    .await?
+                    .or(ov)
+            }
+            _ => ov,
+        };
+        let Some(ov) = ov else {
+            return Ok(None);
+        };
+        // Restamp, so readers of the service root see the vendor built here.
+        ov.stamp(service_root);
+        s.set_vendor_extras(ov.extras);
+        Ok(Some(ov.vendor))
+    }
+
+    /// Pick the vendor to build with. The override file wins, then the caller's
+    /// argument, then what the service root detected.
+    fn pick_vendor(
+        forced: Option<RedfishVendor>,
+        caller: Option<RedfishVendor>,
+        detected: Option<RedfishVendor>,
+    ) -> Result<RedfishVendor, RedfishError> {
+        forced
+            .or(caller)
+            .or(detected)
+            .ok_or(RedfishError::MissingVendor)
+    }
+
+    /// Whether a vendor still has to be settled from fetched resources. Never one
+    /// the override file named, that file has the last word.
+    fn needs_refinement(forced: Option<RedfishVendor>, vendor: RedfishVendor) -> bool {
+        forced.is_none() && matches!(vendor, RedfishVendor::P3809 | RedfishVendor::AMI)
     }
 
     /// Refine a service-root `AMI` vendor to `LenovoGB300` when the host is a
@@ -913,7 +973,7 @@ impl RedfishHttpClient {
 
 /// Order system ids for the Bios probe: preferred host first, then the remaining
 /// members in enumeration order (skipping the preferred id so it is not probed twice).
-fn system_ids_for_bios_probe<'a>(
+pub(crate) fn system_ids_for_bios_probe<'a>(
     preferred: &'a str,
     systems: &'a [String],
 ) -> impl Iterator<Item = &'a str> {
@@ -923,6 +983,18 @@ fn system_ids_for_bios_probe<'a>(
             .map(String::as_str)
             .filter(move |id| *id != preferred),
     )
+}
+
+/// The id of the manager that manages `system`, read off its first `ManagedBy` link.
+/// `None` when the system reports no manager, leaving the caller fallback standing.
+pub(crate) fn manager_id_from_system(system: &ComputerSystem) -> Option<String> {
+    system
+        .links
+        .as_ref()
+        .and_then(|links| links.managed_by.as_ref())
+        .and_then(|mb| mb.first())
+        .and_then(|d| d.odata_id.trim_matches('/').split('/').next_back())
+        .map(|m| m.to_string())
 }
 
 fn truncate(s: &str, len: usize) -> &str {
@@ -979,6 +1051,123 @@ fn redact_sensitive_fields(body: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The override file outranks both a caller supplied vendor and what the service
+    // root advertises, the two other ways `create_client_impl` can learn a vendor.
+    #[test]
+    fn override_file_vendor_outranks_caller_and_detection() {
+        assert_eq!(
+            RedfishClientPool::pick_vendor(
+                Some(RedfishVendor::Rune),
+                Some(RedfishVendor::Dell),
+                Some(RedfishVendor::Supermicro),
+            )
+            .unwrap(),
+            RedfishVendor::Rune
+        );
+        // Without an entry the existing order stands, caller then detection.
+        assert_eq!(
+            RedfishClientPool::pick_vendor(
+                None,
+                Some(RedfishVendor::Dell),
+                Some(RedfishVendor::Supermicro),
+            )
+            .unwrap(),
+            RedfishVendor::Dell
+        );
+        assert_eq!(
+            RedfishClientPool::pick_vendor(None, None, Some(RedfishVendor::Supermicro)).unwrap(),
+            RedfishVendor::Supermicro
+        );
+        assert!(matches!(
+            RedfishClientPool::pick_vendor(None, None, None),
+            Err(RedfishError::MissingVendor)
+        ));
+    }
+
+    // A matched entry reaches the client whole, the forced vendor plus the variant,
+    // script and data a vendor implementation reads.
+    #[tokio::test]
+    async fn override_entry_is_applied_to_the_client() {
+        let endpoint = Endpoint {
+            host: "bmc.example".to_string(),
+            ..Default::default()
+        };
+        let mut s = RedfishStandard::new(RedfishHttpClient::new(
+            HttpClient::new(),
+            endpoint,
+            Vec::new(),
+        ));
+        let mut service_root = crate::model::service_root::ServiceRoot::default();
+        let ov = crate::vendor_override::VendorOverride {
+            vendor: RedfishVendor::Rune,
+            extras: crate::vendor_override::VendorExtras {
+                variant: Some("model-x".to_string()),
+                script: Some("/etc/bmc.rn".to_string()),
+                data: Some(serde_json::json!({ "k": 1 })),
+            },
+        };
+
+        let forced = RedfishClientPool::apply_override(
+            &mut s,
+            &mut service_root,
+            Some(ov),
+            &["BMC_0".to_string()],
+            "BMC_0",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(forced, Some(RedfishVendor::Rune));
+        assert_eq!(service_root.vendor(), Some(RedfishVendor::Rune));
+        assert_eq!(s.vendor_variant(), Some("model-x"));
+        assert_eq!(s.vendor_script(), Some("/etc/bmc.rn"));
+        assert_eq!(s.vendor_data(), Some(&serde_json::json!({ "k": 1 })));
+
+        // Without an entry nothing is forced and the service root is left alone.
+        let mut untouched = crate::model::service_root::ServiceRoot::default();
+        let forced = RedfishClientPool::apply_override(
+            &mut s,
+            &mut untouched,
+            None,
+            &["BMC_0".to_string()],
+            "BMC_0",
+        )
+        .await
+        .unwrap();
+        assert_eq!(forced, None);
+        assert_eq!(untouched.override_vendor, None);
+    }
+
+    // An override entry is final, so the refinements that probe the BMC never run
+    // for it. Only P3809 and AMI would ever be rewritten.
+    #[test]
+    fn override_file_vendor_is_never_refined() {
+        for vendor in [
+            RedfishVendor::P3809,
+            RedfishVendor::AMI,
+            RedfishVendor::Rune,
+            RedfishVendor::Dell,
+        ] {
+            assert!(
+                !RedfishClientPool::needs_refinement(Some(vendor), vendor),
+                "{vendor} from the override file must be used as is"
+            );
+        }
+        // Detected ones still are.
+        assert!(RedfishClientPool::needs_refinement(
+            None,
+            RedfishVendor::P3809
+        ));
+        assert!(RedfishClientPool::needs_refinement(
+            None,
+            RedfishVendor::AMI
+        ));
+        assert!(!RedfishClientPool::needs_refinement(
+            None,
+            RedfishVendor::Dell
+        ));
+    }
 
     #[test]
     fn test_truncate() {
@@ -1136,5 +1325,47 @@ mod tests {
         let preferred = systems.first().map(String::as_str).unwrap();
         let order: Vec<&str> = system_ids_for_bios_probe(preferred, &systems).collect();
         assert_eq!(order, vec!["DGX", "HGX_Baseboard_0"]);
+    }
+
+    fn system_managed_by(links: Option<Vec<&str>>) -> ComputerSystem {
+        use crate::model::system::ComputerSystemLinks;
+        use crate::ODataId;
+
+        ComputerSystem {
+            links: links.map(|ids| ComputerSystemLinks {
+                managed_by: Some(
+                    ids.into_iter()
+                        .map(|id| ODataId::from(id.to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn manager_id_comes_from_the_first_managed_by_link() {
+        let system = system_managed_by(Some(vec![
+            "/redfish/v1/Managers/BMC_0",
+            "/redfish/v1/Managers/HGX_BMC_0",
+        ]));
+        assert_eq!(manager_id_from_system(&system).as_deref(), Some("BMC_0"));
+    }
+
+    #[test]
+    fn manager_id_tolerates_a_trailing_slash() {
+        let system = system_managed_by(Some(vec!["/redfish/v1/Managers/BMC_0/"]));
+        assert_eq!(manager_id_from_system(&system).as_deref(), Some("BMC_0"));
+    }
+
+    #[test]
+    fn manager_id_is_none_without_a_managed_by_link() {
+        // Both shapes leave the caller's fallback manager standing.
+        assert_eq!(manager_id_from_system(&system_managed_by(None)), None);
+        assert_eq!(
+            manager_id_from_system(&system_managed_by(Some(vec![]))),
+            None
+        );
     }
 }

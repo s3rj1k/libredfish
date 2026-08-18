@@ -59,7 +59,9 @@ mod nvidia_gbx00;
 mod nvidia_gh200;
 mod nvidia_vera_rubin;
 mod nvidia_viking;
+mod rune_vendor;
 mod supermicro;
+mod vendor_override;
 pub use network::{Endpoint, RedfishClientPool, RedfishClientPoolBuilder, REDFISH_ENDPOINT};
 pub mod standard;
 pub use error::RedfishError;
@@ -696,7 +698,7 @@ impl fmt::Display for Boot {
 
 /// The current status of something (lockdown, serial_console), saying whether it has been enabled,
 /// disabled, or the necessary settings are only partially applied.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Status {
     pub(crate) status: StatusInternal,
     pub(crate) message: String,
@@ -708,7 +710,7 @@ impl std::fmt::Display for Status {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
 enum StatusInternal {
     Enabled,
     Partial,
@@ -843,7 +845,7 @@ fn extract_resolved_mac(mac: Option<&str>, id: &str) -> Result<String, RedfishEr
     Ok(mac.to_string())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MachineSetupStatus {
     pub is_done: bool,
     pub diffs: Vec<MachineSetupDiff>,
@@ -868,7 +870,7 @@ impl fmt::Display for MachineSetupStatus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MachineSetupDiff {
     pub key: String,
     pub expected: String,

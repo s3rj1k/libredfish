@@ -70,6 +70,9 @@ pub struct RedfishStandard {
     manager_id: String,
     system_id: String,
     service_root: ServiceRoot,
+    /// Variant, script and data from a vendor override entry, read by the vendor
+    /// implementation. Grouped in `VendorExtras`, see the vendor_override module.
+    vendor_extras: crate::vendor_override::VendorExtras,
 }
 impl Redfish for RedfishStandard {
     fn create_user<'a>(
@@ -162,9 +165,10 @@ impl Redfish for RedfishStandard {
                 }
                 _ => self.get_service_root().await?,
             };
-            // AMI BMC requires If-Match header for PATCH requests
+            // AMI BMCs need patch_with_if_match. Follow the detected vendor so a
+            // forced one cannot mask this hardware quirk.
             if matches!(
-                service_root.vendor(),
+                service_root.detected_vendor(),
                 Some(RedfishVendor::AMI | RedfishVendor::LenovoAMI | RedfishVendor::LenovoGB300)
             ) {
                 self.client.patch_with_if_match(&url, &data).await
@@ -867,6 +871,9 @@ impl Redfish for RedfishStandard {
     ) -> crate::RedfishFuture<'a, Result<ServiceRoot, RedfishError>> {
         Box::pin(async move {
             let (_status_code, mut body): (StatusCode, ServiceRoot) = self.client.get("").await?;
+            // Let a vendor override file pin the vendor. Fails closed on a bad file,
+            // matching client creation.
+            crate::vendor_override::stamp(&mut body, self.client.host(), self.manager_id()).await?;
             if body.vendor.is_none() && !self.client.is_anonymous() {
                 // Power shelves don't advertise a vendor in the service root,
                 // so fall back to the Manufacturer of the first chassis that
@@ -1390,6 +1397,7 @@ impl RedfishStandard {
             RedfishVendor::DeltaPowerShelf => {
                 Ok(Box::new(crate::delta_powershelf::Bmc::new(self.clone())?))
             }
+            RedfishVendor::Rune => Ok(Box::new(crate::rune_vendor::Bmc::new(self.clone())?)),
             _ => Ok(Box::new(self.clone())),
         }
     }
@@ -1420,6 +1428,7 @@ impl RedfishStandard {
             system_id: "".to_string(),
             vendor: None,
             service_root: default::Default::default(),
+            vendor_extras: default::Default::default(),
         }
     }
 
@@ -1429,6 +1438,45 @@ impl RedfishStandard {
 
     pub fn manager_id(&self) -> &str {
         &self.manager_id
+    }
+
+    /// Carry a whole vendor override entry's extras. Call before `set_vendor` so
+    /// they reach the vendor client.
+    pub(crate) fn set_vendor_extras(&mut self, extras: crate::vendor_override::VendorExtras) {
+        self.vendor_extras = extras;
+    }
+
+    /// Set the optional vendor variant, a free form host type a vendor
+    /// implementation can branch on. Call before `set_vendor`.
+    pub fn set_vendor_variant(&mut self, variant: Option<String>) {
+        self.vendor_extras.variant = variant;
+    }
+
+    /// The optional vendor variant supplied via the vendor override file, if any.
+    pub fn vendor_variant(&self) -> Option<&str> {
+        self.vendor_extras.variant.as_deref()
+    }
+
+    /// Set the optional Rune script path implementing the vendor. Call before
+    /// `set_vendor`.
+    pub fn set_vendor_script(&mut self, script: Option<String>) {
+        self.vendor_extras.script = script;
+    }
+
+    /// The optional Rune script path supplied via the vendor override file, if any.
+    pub fn vendor_script(&self) -> Option<&str> {
+        self.vendor_extras.script.as_deref()
+    }
+
+    /// Set the optional free form JSON blob handed to the vendor implementation
+    /// as is. Call before `set_vendor`.
+    pub fn set_vendor_data(&mut self, data: Option<serde_json::Value>) {
+        self.vendor_extras.data = data;
+    }
+
+    /// The optional free form JSON blob supplied via the vendor override file.
+    pub fn vendor_data(&self) -> Option<&serde_json::Value> {
+        self.vendor_extras.data.as_ref()
     }
 
     /// Gets the location of the update service from the saved service root

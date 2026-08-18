@@ -25,7 +25,7 @@ use crate::OData;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GPUSensors {
     pub gpu_id: String,
     pub sensors: Vec<Sensor>,

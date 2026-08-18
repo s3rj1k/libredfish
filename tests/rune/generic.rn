@@ -1,0 +1,88 @@
+// Rune vendor override example for a limited server BMC. Overrides replace standard
+// Redfish behavior, everything else falls back to it. See tests/rune/README.md.
+
+// Patches the system `Boot` object. `mode`/`http_boot_uri` are omitted when absent.
+pub async fn set_boot_override(ctx, target, enabled, mode, http_boot_uri) {
+    let boot = #{
+        "BootSourceOverrideTarget": target,
+        "BootSourceOverrideEnabled": enabled,
+    };
+    if let Some(m) = mode {
+        boot["BootSourceOverrideMode"] = m;
+    }
+    if let Some(uri) = http_boot_uri {
+        boot["HttpBootUri"] = uri;
+    }
+    ctx.patch(`Systems/${ctx.system_id()}`, #{ "Boot": boot }).await?;
+    None
+}
+
+pub async fn boot_once(ctx, target) {
+    set_boot_override(ctx, target, "Once", None, None).await
+}
+
+pub async fn boot_first(ctx, target) {
+    set_boot_override(ctx, target, "Continuous", None, None).await
+}
+
+// Limited BMC boots the PXE network device first (persistent).
+pub async fn set_boot_order_dpu_first(ctx) {
+    set_boot_override(ctx, "Pxe", "Continuous", None, None).await
+}
+
+// A limited BMC cannot apply BIOS profiles or run setup jobs, so machine_setup is a no op
+// and the setup checks report complete so host bring up proceeds.
+pub async fn machine_setup(ctx) {
+    None
+}
+
+pub async fn is_bios_setup(ctx) {
+    true
+}
+
+pub async fn is_boot_order_setup(ctx) {
+    true
+}
+
+// True so callers skip the unsupported NetworkProtocol PATCH, IPMI is set up separately.
+pub async fn is_ipmi_over_lan_enabled(ctx) {
+    true
+}
+
+// Limited BMC 404s the standard FirmwareInventory, so return empty and fetch_service() succeeds.
+pub async fn get_software_inventories(ctx) {
+    []
+}
+
+// Limited BMC exposes only a vendor specific UpdateService, so return a default and callers skip it.
+pub async fn get_update_service(ctx) {
+    #{}
+}
+
+// Limited BMC 404s Systems/{id}/SecureBoot, so report it disabled and site explorer records it off.
+// The libredfish SecureBoot model requires @odata.id, @odata.type, Id, Name, rest optional.
+pub async fn get_secure_boot(ctx) {
+    #{
+        "@odata.id": "/redfish/v1/Systems/Self/SecureBoot",
+        "@odata.type": "#SecureBoot.v1_1_0.SecureBoot",
+        "Id": "SecureBoot",
+        "Name": "UEFI Secure Boot",
+        "SecureBootEnable": false,
+        "SecureBootCurrentBoot": "Disabled",
+    }
+}
+
+// A blank Chassis SerialNumber cannot match an ExpectedMachine, so synthesize a stable
+// sha256 of bmc_address, manager_id and id. Real serials pass through.
+pub async fn get_chassis(ctx, id) {
+    let resp = ctx.get(`Chassis/${id}`).await?;
+    let chassis = resp["body"];
+    let blank = match chassis.get("SerialNumber") {
+        Some(sn) => if sn is String { sn.trim().is_empty() } else { true },
+        None => true,
+    };
+    if blank {
+        chassis["SerialNumber"] = sha256(`${ctx.bmc_address()}${ctx.manager_id()}${id}`);
+    }
+    chassis
+}

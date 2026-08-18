@@ -1,0 +1,1000 @@
+// Rune vendor override for a Dell iDRAC, the counterpart to sushy.rn for real
+// hardware. Anything not defined here falls back to standard, see hw.md.
+
+// The Manager advertises its vendor under Oem and that picks the path below.
+// Matched case insensitively and read per call because scripts hold no state.
+async fn is_dell(ctx) {
+    match ctx.get(`Managers/${ctx.manager_id()}`).await {
+        Ok(resp) => match resp["body"].get("Oem") {
+            Some(oem) => oem.keys().any(|k| k.to_lowercase() == "dell"),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+// A string from the override file data field, empty when absent.
+fn dell_data(ctx, key) {
+    match ctx.vendor_data() {
+        Some(data) => match data.get(key) {
+            Some(v) => if v is String { v } else { "" },
+            None => "",
+        },
+        None => "",
+    }
+}
+
+// Interfaces the BIOS registry accepts for HttpDev1Interface.
+async fn dell_http_iface_values(ctx) {
+    let out = [];
+    let resp = match ctx.get(`Systems/${ctx.system_id()}/Bios/BiosRegistry`).await {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    let entries = match resp["body"].get("RegistryEntries") {
+        Some(e) => match e.get("Attributes") {
+            Some(a) => a,
+            None => return out,
+        },
+        None => return out,
+    };
+    for a in entries {
+        let name = match a.get("AttributeName") {
+            Some(n) => if n is String { n } else { "" },
+            None => "",
+        };
+        if name == "HttpDev1Interface" {
+            match a.get("Value") {
+                Some(vals) => for v in vals {
+                    match v.get("ValueName") {
+                        Some(x) => out.push(x),
+                        None => {}
+                    }
+                },
+                None => {}
+            }
+        }
+    }
+    out
+}
+
+// Boot NIC as the BIOS names it. An explicit http_boot_nic in the override data wins,
+// otherwise pick a cabled port the registry also accepts.
+async fn dell_boot_slot(ctx) {
+    let pinned = dell_data(ctx, "http_boot_nic");
+    if pinned != "" {
+        return pinned;
+    }
+    let allowed = dell_http_iface_values(ctx).await;
+    let ifaces = match ctx.expand_collection(`Systems/${ctx.system_id()}/EthernetInterfaces`).await {
+        Ok(c) => c["Members"],
+        Err(_) => return "",
+    };
+    for m in ifaces {
+        let id = match m.get("Id") {
+            Some(v) => if v is String { v } else { "" },
+            None => "",
+        };
+        let link = match m.get("LinkStatus") {
+            Some(v) => if v is String { v } else { "" },
+            None => "",
+        };
+        if link == "LinkUp" && allowed.iter().any(|x| x == id) {
+            return id;
+        }
+    }
+    ""
+}
+
+// Value HttpDev1TlsMode takes to turn authentication off, read from the registry so
+// the wording stays whatever this firmware calls it.
+async fn dell_tls_off_value(ctx) {
+    let fallback = "None";
+    let resp = match ctx.get(`Systems/${ctx.system_id()}/Bios/BiosRegistry`).await {
+        Ok(r) => r,
+        Err(_) => return fallback,
+    };
+    let entries = match resp["body"].get("RegistryEntries") {
+        Some(e) => match e.get("Attributes") {
+            Some(a) => a,
+            None => return fallback,
+        },
+        None => return fallback,
+    };
+    for a in entries {
+        let name = match a.get("AttributeName") {
+            Some(n) => if n is String { n } else { "" },
+            None => "",
+        };
+        if name == "HttpDev1TlsMode" {
+            match a.get("Value") {
+                Some(vals) => for v in vals {
+                    match v.get("ValueName") {
+                        Some(x) => if x is String && x.to_lowercase() == "none" {
+                            return x;
+                        },
+                        None => {}
+                    }
+                },
+                None => {}
+            }
+        }
+    }
+    fallback
+}
+
+// The smallest set that makes UEFI HTTP boot happen on the boot NIC. Boot order is not
+// here, SetBootOrderEn only enables devices and does not control the sequence.
+async fn dell_bios_attrs(ctx, slot, uri) {
+    let attrs = #{
+        "HttpDev1EnDis": "Enabled",
+        "HttpDev1Interface": slot,
+        "HttpDev1Protocol": "IPv4",
+        "HttpDev1DhcpEnDis": "Enabled",
+        // Firmware answers UEFI0417 and refuses plain http while this is OneWay.
+        "HttpDev1TlsMode": dell_tls_off_value(ctx).await,
+    };
+    // Without a URI the firmware has nothing to fetch and drops straight to the next
+    // boot device. DHCP still supplies the address, it does not supply this.
+    if uri != "" {
+        attrs["HttpDev1Uri"] = uri;
+    }
+    attrs
+}
+
+// True when every wanted attribute is already pending in Bios/Settings.
+async fn dell_bios_staged(ctx, want) {
+    let resp = match ctx.get(`Systems/${ctx.system_id()}/Bios/Settings`).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let attrs = match resp["body"].get("Attributes") {
+        Some(a) => a,
+        None => return false,
+    };
+    let staged = true;
+    for k in want.keys() {
+        let have = match attrs.get(k) {
+            Some(v) => if v is String { v } else { "" },
+            None => "",
+        };
+        if have != want[k] {
+            staged = false;
+        }
+    }
+    staged
+}
+
+// Job id from the Location header of a settings patch, None when absent.
+fn dell_job_id(resp) {
+    let loc = match resp.get("headers") {
+        Some(h) => match h.get("location") {
+            Some(v) => if v is String { v } else { "" },
+            None => "",
+        },
+        None => "",
+    };
+    if loc == "" {
+        return None;
+    }
+    let last = "";
+    for part in loc.split("/") {
+        if part != "" {
+            last = part;
+        }
+    }
+    if last == "" {
+        None
+    } else {
+        Some(last)
+    }
+}
+
+// JobState is deserialized from a lowercase name, and Dell reports states that are not
+// in that enum, so anything unrecognised degrades to unknown instead of failing.
+fn dell_job_state_name(raw) {
+    match raw.to_lowercase() {
+        "scheduled" => "scheduled",
+        "running" => "running",
+        "completed" => "completed",
+        "completedwitherrors" => "completedwitherrors",
+        "scheduledwitherrors" => "scheduledwitherrors",
+        "failed" => "failed",
+        _ => "unknown",
+    }
+}
+
+// Dell keeps jobs under its own Oem path, which the standard implementation cannot read.
+pub async fn get_job_state(ctx, job_id) {
+    if !is_dell(ctx).await {
+        return "unknown";
+    }
+    let mgr = ctx.manager_id();
+    let resp = match ctx.get(`Managers/${mgr}/Oem/Dell/Jobs/${job_id}`).await {
+        Ok(r) => r,
+        Err(_) => return "unknown",
+    };
+    let raw = match resp["body"].get("JobState") {
+        Some(v) => if v is String { v } else { "" },
+        None => "",
+    };
+    dell_job_state_name(raw)
+}
+
+// Last path segment of a Redfish odata id, empty when there is nothing to take.
+fn dell_last_segment(id) {
+    let last = "";
+    for part in id.split("/") {
+        if part != "" {
+            last = part;
+        }
+    }
+    last
+}
+
+// Drive references the storage controller owns. A failed lookup is an error rather
+// than an empty list, which would read as a controller with no drives at all.
+async fn dell_storage_drives(ctx, controller_id) {
+    let resp = ctx.get(`Systems/${ctx.system_id()}/Storage/${controller_id}`).await?;
+    match resp["body"].get("Drives") {
+        Some(d) => Ok(d),
+        None => Err(`controller ${controller_id} has no Drives member`),
+    }
+}
+
+// Dell numbers its attribute groups and the index is not guaranteed to be 1, so the
+// live key is matched on group and field. Falls back to 1 when nothing matches.
+fn dell_attr_key(attrs, group, field) {
+    for k in attrs.keys() {
+        if k.starts_with(`${group}.`) && k.ends_with(`.${field}`) {
+            return k;
+        }
+    }
+    `${group}.1.${field}`
+}
+
+// Manager attributes, an empty object when they cannot be read.
+async fn dell_manager_attrs(ctx) {
+    let mgr = ctx.manager_id();
+    match ctx.get(`Managers/${mgr}/Oem/Dell/DellAttributes/${mgr}`).await {
+        Ok(resp) => match resp["body"].get("Attributes") {
+            Some(a) => a,
+            None => #{},
+        },
+        Err(_) => #{},
+    }
+}
+
+// Racadm follows lockdown the way the vendor implementation pairs the two. Boot
+// settings stay untouched because the http boot config in this file owns them.
+async fn dell_set_lockdown(ctx, target) {
+    let mgr = ctx.manager_id();
+    let attrs = dell_manager_attrs(ctx).await;
+    let lock_key = dell_attr_key(attrs, "Lockdown", "SystemLockdown");
+    let racadm_key = dell_attr_key(attrs, "Racadm", "Enable");
+    if target == "Enabled" {
+        // Lockdown applies at once and would reject anything sent alongside it. The url is
+        // rebuilt per call because patch takes the string and a reused binding cannot be.
+        let racadm_off = #{};
+        racadm_off[racadm_key] = "Disabled";
+        let _ = ctx.patch(`Managers/${mgr}/Oem/Dell/DellAttributes/${mgr}`,
+                          #{ "Attributes": racadm_off }).await;
+        let lock_on = #{};
+        lock_on[lock_key] = "Enabled";
+        ctx.patch(`Managers/${mgr}/Oem/Dell/DellAttributes/${mgr}`,
+                  #{ "Attributes": lock_on }).await?;
+    } else {
+        let unlock = #{};
+        unlock[lock_key] = "Disabled";
+        unlock[racadm_key] = "Enabled";
+        ctx.patch(`Managers/${mgr}/Oem/Dell/DellAttributes/${mgr}`,
+                  #{ "Attributes": unlock }).await?;
+    }
+    Ok(())
+}
+
+// Lockdown blocks every provisioning write, so the boss erase unlocks first. The value
+// arrives as the Redfish spelling, Enabled or Disabled.
+pub async fn set_idrac_lockdown(ctx, enabled) {
+    if !is_dell(ctx).await {
+        return ();
+    }
+    dell_set_lockdown(ctx, enabled).await?;
+    ()
+}
+
+// The same switch under the name the uefi setup path calls. The standard implementation
+// is a no op that reports success, so the host stayed locked and every write after failed.
+pub async fn lockdown_bmc(ctx, target) {
+    if !is_dell(ctx).await {
+        return ();
+    }
+    dell_set_lockdown(ctx, target).await?;
+    ()
+}
+
+// Lockdown counts as fully on only when racadm is off alongside it, and fully off only
+// when racadm is on, so a half applied pair reports Partial rather than a confident wrong.
+async fn dell_lockdown_state(ctx) {
+    let mgr = ctx.manager_id();
+    let attrs = match ctx.get(`Managers/${mgr}/Oem/Dell/DellAttributes/${mgr}`).await {
+        Ok(resp) => match resp["body"].get("Attributes") {
+            Some(a) => a,
+            None => return #{ "status": "Partial", "message": "DellAttributes has no Attributes" },
+        },
+        Err(_) => return #{ "status": "Partial", "message": "DellAttributes unreadable" },
+    };
+    let sl = match attrs.get(dell_attr_key(attrs, "Lockdown", "SystemLockdown")) {
+        Some(v) => if v is String { v } else { "" },
+        None => "",
+    };
+    let racadm = match attrs.get(dell_attr_key(attrs, "Racadm", "Enable")) {
+        Some(v) => if v is String { v } else { "" },
+        None => "",
+    };
+    let status = if sl == "Enabled" && racadm == "Disabled" {
+        "Enabled"
+    } else if sl == "Disabled" && racadm == "Enabled" {
+        "Disabled"
+    } else {
+        "Partial"
+    };
+    #{ "status": status, "message": `BMC system_lockdown=${sl}, racadm=${racadm}.` }
+}
+
+// Without this the caller is told the vendor cannot report lockdown at all, and the
+// validation path then writes boot config into a locked bmc.
+pub async fn lockdown_status(ctx) {
+    if !is_dell(ctx).await {
+        return Err("lockdown_status reached a non Dell machine");
+    }
+    dell_lockdown_state(ctx).await
+}
+
+// BootSeqRetry is the Dell name for retrying the boot sequence forever.
+pub async fn is_infinite_boot_enabled(ctx) {
+    if !is_dell(ctx).await {
+        return None;
+    }
+    let attrs = match ctx.get(`Systems/${ctx.system_id()}/Bios`).await {
+        Ok(resp) => match resp["body"].get("Attributes") {
+            Some(a) => a,
+            None => return None,
+        },
+        Err(_) => return None,
+    };
+    match attrs.get("BootSeqRetry") {
+        Some(v) => if v is String { Some(v == "Enabled") } else { None },
+        None => None,
+    }
+}
+
+// Storage controller id of the BOSS card. Without this the caller falls back to a
+// generic nvme wipe, which the BOSS rejects with an invalid opcode.
+pub async fn get_boss_controller(ctx) {
+    if !is_dell(ctx).await {
+        return None;
+    }
+    let members = match ctx.get(`Systems/${ctx.system_id()}/Storage`).await {
+        Ok(r) => match r["body"].get("Members") {
+            Some(m) => m,
+            None => return None,
+        },
+        Err(_) => return None,
+    };
+    for m in members {
+        let odata = match m.get("@odata.id") {
+            Some(v) => if v is String { v } else { "" },
+            None => "",
+        };
+        if odata.contains("BOSS") {
+            let id = dell_last_segment(odata);
+            if id != "" {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+// True when the controller cannot apply a raid job while the host runs. Dell accepts
+// the job either way and then leaves it Scheduled until the next boot.
+async fn dell_controller_needs_reboot(ctx, controller_id) {
+    let resp = match ctx.get(`Systems/${ctx.system_id()}/Storage/${controller_id}`).await {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    let cap = match resp["body"].get("Oem") {
+        Some(oem) => match oem.get("Dell") {
+            Some(dell) => match dell.get("DellController") {
+                Some(c) => match c.get("RealtimeCapability") {
+                    Some(v) => if v is String { v } else { "" },
+                    None => "",
+                },
+                None => "",
+            },
+            None => "",
+        },
+        None => "",
+    };
+    cap != "Capable"
+}
+
+// Applies a staged raid job by restarting the host. The queued reboot job drains on
+// the way down and the raid job runs during post.
+async fn dell_apply_staged_raid_job(ctx, controller_id) {
+    if !dell_controller_needs_reboot(ctx, controller_id).await {
+        return ();
+    }
+    let _ = ctx.post(`Systems/${ctx.system_id()}/Actions/ComputerSystem.Reset`,
+                     #{ "ResetType": "ForceRestart" }).await;
+    ()
+}
+
+// Lifecycle controller state, empty when it cannot be read. A storage job posted
+// while this is busy is accepted and then never runs.
+async fn dell_lc_status(ctx) {
+    let mgr = ctx.manager_id();
+    let resp = match ctx.post(
+        `Managers/${mgr}/Oem/Dell/DellLCService/Actions/DellLCService.GetRemoteServicesAPIStatus`,
+        #{},
+    ).await {
+        Ok(r) => r,
+        Err(_) => return "",
+    };
+    match resp["body"].get("LCStatus") {
+        Some(v) => if v is String { v } else { "" },
+        None => "",
+    }
+}
+
+// Wipes the drives behind a BOSS controller through its own Oem action.
+pub async fn decommission_storage_controller(ctx, controller_id) {
+    if !is_dell(ctx).await {
+        return None;
+    }
+    let lc = dell_lc_status(ctx).await;
+    if lc != "Ready" {
+        return Err(`lifecycle controller is ${lc} not Ready, decommission would never run`);
+    }
+    let sys = ctx.system_id();
+    let resp = ctx.post(
+        `Systems/${sys}/Storage/${controller_id}/Actions/Oem/DellStorage.ControllerDrivesDecommission`,
+        #{ "@Redfish.OperationApplyTime": "Immediate" },
+    ).await?;
+    let jid = dell_job_id(resp);
+    dell_apply_staged_raid_job(ctx, controller_id).await;
+    jid
+}
+
+// Rebuilds the boot volume after the wipe. One drive mirrors nothing, two mirror
+// each other, and anything else is not a shape this card is used in.
+pub async fn create_storage_volume(ctx, controller_id, volume_name) {
+    if !is_dell(ctx).await {
+        return Err("create_storage_volume reached a non Dell machine");
+    }
+    let lc = dell_lc_status(ctx).await;
+    if lc != "Ready" {
+        return Err(`lifecycle controller is ${lc} not Ready, volume create would never run`);
+    }
+    let drives = dell_storage_drives(ctx, controller_id).await?;
+    // Counted by hand because len returns an unsigned that never matches a signed
+    // literal pattern, which silently sent every drive count to the fallback arm.
+    let n = 0;
+    for _drive in drives {
+        n += 1;
+    }
+    let raid_type = match n {
+        1 => "RAID0",
+        2 => "RAID1",
+        _ => return Err(`controller ${controller_id} has ${n} drives, expected 1 or 2`),
+    };
+    let resp = ctx.post(`Systems/${ctx.system_id()}/Storage/${controller_id}/Volumes`, #{
+        "Name": volume_name,
+        "RAIDType": raid_type,
+        "Links": #{ "Drives": drives },
+    }).await?;
+    let jid = match dell_job_id(resp) {
+        Some(j) => j,
+        None => return Err(`volume create on ${controller_id} returned no job id`),
+    };
+    // No reboot here, the caller has its own RebootHost step once the job is scheduled.
+    Some(jid)
+}
+
+// JID_CLEARALL drops the config jobs but leaves the RID reboot jobs behind, so those are
+// deleted one by one. Best effort, a queue that will not clear is not fatal by itself.
+async fn dell_clear_job_queue(ctx) {
+    let mgr = ctx.manager_id();
+    let _ = ctx.post(`Managers/${mgr}/Oem/Dell/DellJobService/Actions/DellJobService.DeleteJobQueue`,
+                     #{ "JobID": "JID_CLEARALL" }).await;
+    let members = match ctx.get(`Managers/${mgr}/Oem/Dell/Jobs`).await {
+        Ok(r) => match r["body"].get("Members") {
+            Some(m) => m,
+            None => return (),
+        },
+        Err(_) => return (),
+    };
+    for m in members {
+        let odata = match m.get("@odata.id") {
+            Some(v) => if v is String { v } else { continue },
+            None => continue,
+        };
+        let last = "";
+        for part in odata.split("/") {
+            if part != "" {
+                last = part;
+            }
+        }
+        // Only the reboot jobs, because deleting everything also takes out config jobs
+        // a caller has just created and is waiting on.
+        if last.starts_with("RID_") {
+            let _ = ctx.delete(`Managers/${mgr}/Oem/Dell/Jobs/${last}`).await;
+        }
+    }
+    ()
+}
+
+// Dell calls the uefi password SetupPassword and needs an explicit bios config job, and
+// the standard path sends AdministratorPassword with no job, which this firmware rejects.
+pub async fn change_uefi_password(ctx, current_uefi_password, new_uefi_password) {
+    if !is_dell(ctx).await {
+        return Err("change_uefi_password reached a non Dell machine");
+    }
+    // The caller unlocks in its own step, but it only reaches that step once, so a retry
+    // after a failure here would otherwise keep hitting SYS406 forever.
+    dell_set_lockdown(ctx, "Disabled").await?;
+    dell_clear_job_queue(ctx).await;
+    ctx.post(`Systems/${ctx.system_id()}/Bios/Actions/Bios.ChangePassword`, #{
+        "PasswordName": "SetupPassword",
+        "OldPassword": current_uefi_password,
+        "NewPassword": new_uefi_password,
+    }).await?;
+    let resp = ctx.post(`Managers/${ctx.manager_id()}/Oem/Dell/Jobs`, #{
+        "TargetSettingsURI": `/redfish/v1/Systems/${ctx.system_id()}/Bios/Settings`,
+    }).await?;
+    match dell_job_id(resp) {
+        Some(j) => Some(j),
+        None => Err("uefi password config job returned no job id"),
+    }
+}
+
+// Clearing is the same call with an empty new password.
+pub async fn clear_uefi_password(ctx, current_uefi_password) {
+    change_uefi_password(ctx, current_uefi_password, "").await
+}
+
+// Enables UEFI HTTP boot on Dell and does nothing anywhere else. Applies on the next
+// reset, and a staged config would block the patch so the job queue is cleared first.
+pub async fn machine_setup(ctx) {
+    if !is_dell(ctx).await {
+        return None;
+    }
+    let slot = dell_boot_slot(ctx).await;
+    if slot == "" {
+        return None;
+    }
+
+    // Already staged by an earlier run, so leave the pending job alone and let the
+    // caller reboot to apply it. Patching again would delete the job and lose the work.
+    if dell_bios_staged(ctx, dell_bios_attrs(ctx, slot, dell_data(ctx, "http_boot_uri")).await).await {
+        return None;
+    }
+
+    // iDRAC answers JCP012 at random here and a stale staged config only matters if the
+    // patch below then fails, so a failed clear must not abort the setup.
+    dell_clear_job_queue(ctx).await;
+
+    let resp = ctx.patch(`Systems/${ctx.system_id()}/Bios/Settings`, #{
+        "@Redfish.SettingsApplyTime": #{ "ApplyTime": "OnReset" },
+        "Attributes": dell_bios_attrs(ctx, slot, dell_data(ctx, "http_boot_uri")).await,
+    }).await?;
+    // The attributes only apply on reset, so hand back the job id and let the caller
+    // wait for it. Returning None would skip that wait and the settings would linger.
+    dell_job_id(resp)
+}
+
+// The same comparison is_bios_setup makes, reported per attribute so the caller can say
+// what differs. A done flag is tracked directly because len returns an unsigned.
+pub async fn machine_setup_status(ctx) {
+    if !is_dell(ctx).await {
+        return Err("machine_setup_status reached a non Dell machine");
+    }
+    let diffs = [];
+    let done = true;
+    let slot = dell_boot_slot(ctx).await;
+    if slot == "" {
+        diffs.push(#{ "key": "boot_slot", "expected": "a boot capable nic", "actual": "none" });
+        done = false;
+    } else {
+        let attrs = match ctx.get(`Systems/${ctx.system_id()}/Bios`).await {
+            Ok(resp) => match resp["body"].get("Attributes") {
+                Some(a) => a,
+                None => #{},
+            },
+            Err(_) => #{},
+        };
+        let want = dell_bios_attrs(ctx, slot, dell_data(ctx, "http_boot_uri")).await;
+        for k in want.keys() {
+            let have = match attrs.get(k) {
+                Some(v) => if v is String { v } else { "" },
+                None => "",
+            };
+            if have != want[k] {
+                diffs.push(#{ "key": k, "expected": want[k], "actual": have });
+                done = false;
+            }
+        }
+    }
+    let lock = dell_lockdown_state(ctx).await;
+    if lock["status"] != "Enabled" {
+        diffs.push(#{ "key": "lockdown", "expected": "Enabled", "actual": lock["status"] });
+        done = false;
+    }
+    #{ "is_done": done, "diffs": diffs }
+}
+
+// True when every attribute machine_setup writes already reads back the same. Unknowns
+// answer false so the caller applies rather than trusting a read that did not happen.
+pub async fn is_bios_setup(ctx) {
+    if !is_dell(ctx).await {
+        return Err("is_bios_setup reached a non Dell machine");
+    }
+    let slot = dell_boot_slot(ctx).await;
+    if slot == "" {
+        return false;
+    }
+    // iDRAC answers 503 on this resource while the host is posting, so an unreadable
+    // BIOS counts as not configured and the caller goes on to apply it.
+    let attrs = match ctx.get(`Systems/${ctx.system_id()}/Bios`).await {
+        Ok(resp) => match resp["body"].get("Attributes") {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let want = dell_bios_attrs(ctx, slot, dell_data(ctx, "http_boot_uri")).await;
+    let ok = true;
+    for k in want.keys() {
+        let have = match attrs.get(k) {
+            Some(v) => if v is String { v } else { "" },
+            None => "",
+        };
+        if have != want[k] {
+            ok = false;
+        }
+    }
+    ok
+}
+
+// Id of the boot option that boots over HTTP, empty when the BIOS has not created one.
+async fn dell_http_boot_entry(ctx) {
+    let hint = dell_data(ctx, "http_boot_entry_match");
+    let want = if hint == "" { "http device" } else { hint };
+    let members = match ctx.expand_collection(`Systems/${ctx.system_id()}/BootOptions`).await {
+        Ok(c) => c["Members"],
+        Err(_) => return "",
+    };
+    for m in members {
+        let name = match m.get("DisplayName") {
+            Some(v) => if v is String { v.to_lowercase() } else { "" },
+            None => "",
+        };
+        if name.contains(want) {
+            match m.get("Id") {
+                Some(v) => if v is String { return v; },
+                None => {}
+            }
+        }
+    }
+    ""
+}
+
+// The boot volume option. Netboot has to come first, but what follows matters too, and
+// an OS left on another disk otherwise outranks the volume the machine is provisioned on.
+async fn dell_boot_volume_entry(ctx) {
+    let hint = dell_data(ctx, "boot_volume_entry_match");
+    let want = if hint == "" { "boss" } else { hint };
+    let members = match ctx.expand_collection(`Systems/${ctx.system_id()}/BootOptions`).await {
+        Ok(c) => c["Members"],
+        Err(_) => return "",
+    };
+    for m in members {
+        let name = match m.get("DisplayName") {
+            Some(v) => if v is String { v.to_lowercase() } else { "" },
+            None => "",
+        };
+        if name.contains(want) {
+            match m.get("Id") {
+                Some(v) => if v is String { return v; },
+                None => {}
+            }
+        }
+    }
+    ""
+}
+
+// True when the http boot option is already first in the UEFI boot sequence. Every
+// unknown answers false, so a failed read makes the caller reapply instead of skip.
+pub async fn is_boot_order_setup(ctx) {
+    if !is_dell(ctx).await {
+        return Err("is_boot_order_setup reached a non Dell machine");
+    }
+    let entry = dell_http_boot_entry(ctx).await;
+    if entry == "" {
+        return false;
+    }
+    let resp = match ctx.get(`Systems/${ctx.system_id()}`).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let order = match resp["body"].get("Boot") {
+        Some(b) => match b.get("BootOrder") {
+            Some(o) => o,
+            None => return false,
+        },
+        None => return false,
+    };
+    for first in order {
+        return if first is String { first == entry } else { false };
+    }
+    false
+}
+
+// iDRAC rejects BootSourceOverrideTarget on the systems settings path, so the first boot
+// device is a manager attribute instead. UefiHttp has no equivalent, machine_setup owns it.
+fn dell_boot_device(target) {
+    match target {
+        "Pxe" => "PXE",
+        "HardDisk" => "HDD",
+        _ => "",
+    }
+}
+
+// Once means the firmware reverts to the normal order after a single boot.
+async fn dell_set_first_boot(ctx, target, once) {
+    let device = dell_boot_device(target);
+    if device == "" {
+        return Err(`no Dell first boot device for ${target}`);
+    }
+    let mgr = ctx.manager_id();
+    let attrs = dell_manager_attrs(ctx).await;
+    let boot = #{};
+    boot[dell_attr_key(attrs, "ServerBoot", "FirstBootDevice")] = device;
+    boot[dell_attr_key(attrs, "ServerBoot", "BootOnce")] = if once {
+        "Enabled"
+    } else {
+        "Disabled"
+    };
+    // No apply time. Manager attributes take effect at once, and asking for OnReset here
+    // makes this firmware answer success while staging nothing and changing nothing.
+    ctx.patch(`Managers/${mgr}/Oem/Dell/DellAttributes/${mgr}`, #{
+        "Attributes": boot,
+    }).await?;
+    Ok(())
+}
+
+// The write paths NICo uses to move the host onto its disk once an image is on it. These
+// used to accept and do nothing, which left a provisioned host booting the network first.
+pub async fn boot_once(ctx, target) {
+    if !is_dell(ctx).await {
+        return Err("boot_once reached a non Dell machine");
+    }
+    dell_set_first_boot(ctx, target, true).await?;
+    ()
+}
+
+pub async fn boot_first(ctx, target) {
+    if !is_dell(ctx).await {
+        return Err("boot_first reached a non Dell machine");
+    }
+    dell_set_first_boot(ctx, target, false).await?;
+    ()
+}
+
+// Only meaningful with an http boot uri here, the same limit the vendor implementation
+// documents. Anything else is an error rather than a quiet success.
+pub async fn set_boot_override(ctx, target, enabled, mode, http_boot_uri) {
+    if !is_dell(ctx).await {
+        return Err("set_boot_override reached a non Dell machine");
+    }
+    let uri = match http_boot_uri {
+        Some(u) => u,
+        None => return Err("Dell set_boot_override needs an http boot uri, BootSourceOverrideTarget is not settable on iDRAC"),
+    };
+    let resp = ctx.patch(`Systems/${ctx.system_id()}/Bios/Settings`, #{
+        "@Redfish.SettingsApplyTime": #{ "ApplyTime": "OnReset" },
+        "Attributes": #{
+            "HttpDev1Uri": uri,
+            "HttpDev1EnDis": "Enabled",
+            "HttpDev1DhcpEnDis": "Disabled",
+            "HttpDev1Protocol": "IPv4",
+        },
+    }).await?;
+    dell_job_id(resp)
+}
+
+// Moves the http boot option to the front of the UEFI boot sequence. SetBootOrderEn
+// only enables devices, so this patch is what actually changes the order.
+pub async fn set_boot_order_dpu_first(ctx) {
+    if !is_dell(ctx).await {
+        return None;
+    }
+    let entry = dell_http_boot_entry(ctx).await;
+    if entry == "" {
+        return None;
+    }
+    // A committed pending config makes the patch below fail with SYS011, so the
+    // queue the bios job left behind has to go first.
+    let mgr = ctx.manager_id();
+    let _ = ctx.post(`Managers/${mgr}/Oem/Dell/DellJobService/Actions/DellJobService.DeleteJobQueue`,
+                     #{ "JobID": "JID_CLEARALL" }).await;
+    // Without an apply time the patch is accepted, staged as Deferred and never
+    // scheduled, so the caller gets no job and its verify reads the old order forever.
+
+    // Netboot first, then the volume this machine boots from. Naming the volume keeps
+    // a stale install on another disk from winning the fallback.
+    let order = [entry];
+    let disk = dell_boot_volume_entry(ctx).await;
+    if disk != "" && disk != entry {
+        order.push(disk);
+    }
+    let resp = ctx.patch(`Systems/${ctx.system_id()}/Settings`, #{
+        "@Redfish.SettingsApplyTime": #{ "ApplyTime": "OnReset" },
+        "Boot": #{ "BootOrder": order },
+    }).await?;
+    match dell_job_id(resp) {
+        Some(j) => Some(j),
+        None => Err("boot order patch returned no job id, nothing will apply it"),
+    }
+}
+
+// Read only. The BMC holds its own NTP config and NICo must not overwrite it, so this
+// reads NetworkProtocol and accepts whether or not servers are already set.
+pub async fn set_ntp_servers(ctx, servers) {
+    let resp = ctx.get(`Managers/${ctx.manager_id()}/NetworkProtocol`).await?;
+    let configured = match resp["body"].get("NTP") {
+        Some(ntp) => match ntp.get("NTPServers") {
+            Some(list) => list.len() > 0,
+            None => false,
+        },
+        None => false,
+    };
+    if configured {
+        // Already set on the BMC, leave it alone.
+        return ();
+    }
+    // Nothing configured and nothing we are willing to write, so accept anyway.
+    ()
+}
+
+// Returns empty rather than querying UpdateService/FirmwareInventory. Drop it to get
+// the real firmware inventory.
+pub async fn get_software_inventories(ctx) {
+    []
+}
+
+// Real boot options when the collection answers, empty collection when it does not.
+pub async fn get_boot_options(ctx) {
+    match ctx.get(`Systems/${ctx.system_id()}/BootOptions`).await {
+        Ok(resp) => resp["body"],
+        Err(_) => #{
+            "@odata.type": "#BootOptionCollection.BootOptionCollection",
+            "@odata.id": `/redfish/v1/Systems/${ctx.system_id()}/BootOptions`,
+            "Name": "Boot Options",
+            "Members": [],
+        },
+    }
+}
+
+// Expanded accounts when the collection answers, empty list when it does not.
+pub async fn get_accounts(ctx) {
+    match ctx.expand_collection("AccountService/Accounts").await {
+        Ok(collection) => collection["Members"],
+        Err(_) => [],
+    }
+}
+
+// Real component integrities when the collection answers, empty set when it does not.
+pub async fn get_component_integrities(ctx) {
+    match ctx.expand_collection("ComponentIntegrity").await {
+        Ok(collection) => collection,
+        Err(_) => #{
+            "Name": "ComponentIntegrityCollection",
+            "Members": [],
+            "Members@odata.count": 0,
+        },
+    }
+}
+
+// Drives from the expanded storage collection, empty list when storage is absent.
+// USB entries are skipped and an unreadable drive is dropped rather than failing all.
+pub async fn get_drives_metrics(ctx) {
+    let storage = match ctx.expand_collection(`Systems/${ctx.system_id()}/Storage`).await {
+        Ok(s) => s,
+        Err(_) => return [],
+    };
+    let drives = [];
+    for entry in storage["Members"] {
+        match entry.get("Drives") {
+            Some(refs) => {
+                for d in refs {
+                    let path = d["@odata.id"].replace("/redfish/v1/", "");
+                    if path.contains("USB") {
+                        continue;
+                    }
+                    match ctx.get(path).await {
+                        Ok(resp) => drives.push(resp["body"]),
+                        Err(_) => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    drives
+}
+
+// Expanded collection when the path answers, empty members when it does not.
+pub async fn get_collection(ctx, id) {
+    match ctx.expand_collection(id).await {
+        Ok(collection) => collection,
+        Err(_) => #{ "Members": [] },
+    }
+}
+
+// No get_system override. This BMC reports a correct SerialNumber so the standard
+// implementation is used as is.
+
+// Accept and do nothing. Preingestion opens with a one shot BMC reset that takes the
+// iDRAC away for minutes and the lab does not want that on every ingest.
+pub async fn bmc_reset(ctx) {
+    ()
+}
+
+// Accept and do nothing. A factory reset would drop the BMC static address and its
+// credentials, leaving it reachable only from the physical console.
+pub async fn bmc_reset_to_defaults(ctx) {
+    ()
+}
+
+// Real inventory when the chassis exposes PCIeDevices, empty when it does not.
+// Errors are swallowed because a script error reaching fetch_pcie_devices is fatal.
+pub async fn pcie_devices(ctx) {
+    match ctx.expand_collection(`Chassis/${ctx.system_id()}/PCIeDevices`).await {
+        Ok(collection) => collection["Members"],
+        Err(_) => [],
+    }
+}
+
+// Uses the UefiDevicePath the BMC reports and falls back to the vendor_data lookup
+// keyed by MAC only when it is missing or blank.
+pub async fn get_system_ethernet_interface(ctx, id) {
+    let resp = ctx.get(`Systems/${ctx.system_id()}/EthernetInterfaces/${id}`).await?;
+    let iface = resp["body"];
+    let has_path = match iface.get("UefiDevicePath") {
+        Some(v) => if v is String { !v.trim().is_empty() } else { true },
+        None => false,
+    };
+    if !has_path {
+        let mac = match iface.get("MACAddress") {
+            Some(v) => if v is String { v.to_lowercase() } else { "" },
+            None => "",
+        };
+        if !mac.is_empty() {
+            match ctx.vendor_data() {
+                Some(data) => match data.get("uefi_device_path_by_mac") {
+                    Some(lookup) => match lookup.get(mac) {
+                        Some(path) => {
+                            iface["UefiDevicePath"] = path;
+                        }
+                        None => {}
+                    },
+                    None => {}
+                },
+                None => {}
+            }
+        }
+    }
+    iface
+}

@@ -66,6 +66,7 @@ const NVIDIA_VERA_RUBIN_PORT: &str = "8745";
 const NVIDIA_GBSWITCH_PORT: &str = "8742";
 const LITEON_POWERSHELF_PORT: &str = "8743";
 const DELTA_POWERSHELF_PORT: &str = "8744";
+const RUNE_SUSHY_PORT: &str = "8747";
 
 static SETUP: Once = Once::new();
 
@@ -1053,4 +1054,424 @@ fn get_tmp_dir() -> PathBuf {
         .as_nanos();
     let temp_dir = format!("{}-{}-{}", PYTHON_VENV_DIR, std::process::id(), nanos);
     env::temp_dir().join(&temp_dir)
+}
+
+const RUNE_EXAMPLE_PORT: &str = "8746";
+const RUNE_RESOLVE_IDS_PORT: &str = "8748";
+const RUNE_SUSHY_NO_PCIE_PORT: &str = "8749";
+const RUNE_HW_PORT: &str = "8750";
+const RUNE_HW_NO_NIC_PORT: &str = "8751";
+// sha256 of bmc_address plus manager_id plus chassis id, what generic.rn
+// synthesizes for a blank chassis serial.
+const RUNE_SYNTHESIZED_SERIAL: &str =
+    "ef5ff763e17bf1960d67658f4a58249adda396ea231dbd2b600dfda69cea85fa";
+
+/// The `tests/rune/generic.rn` example must keep working, so a changed dispatch
+/// arity or return type fails CI. Built via `set_vendor_script`, no override file.
+#[tokio::test]
+async fn rune_example_script_overrides_bmc_methods() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("supermicro", RUNE_EXAMPLE_PORT); // stops on drop
+
+    let script = PathBuf::from(ROOT_DIR).join("tests/rune/generic.rn");
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{RUNE_EXAMPLE_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let mut standard = pool.create_standard_client(endpoint)?;
+    standard.set_vendor_script(Some(script.to_string_lossy().into_owned()));
+    let redfish = standard.set_vendor(RedfishVendor::Rune).await?;
+
+    // Overrides that never touch the network.
+    assert!(redfish.is_bios_setup(None).await?, "is_bios_setup");
+    assert!(
+        redfish.is_ipmi_over_lan_enabled().await?,
+        "is_ipmi_over_lan_enabled"
+    );
+    assert!(
+        redfish.get_software_inventories().await?.is_empty(),
+        "get_software_inventories should be []"
+    );
+    // `#{}` relies on UpdateService's container level `#[serde(default)]`.
+    let update_service = redfish.get_update_service().await?;
+    assert_eq!(update_service.http_push_uri, "");
+    assert_eq!(update_service.max_image_size_bytes, 0);
+
+    let secure_boot = redfish.get_secure_boot().await?;
+    assert_eq!(secure_boot.id, "SecureBoot");
+    assert_eq!(secure_boot.name, "UEFI Secure Boot");
+    assert_eq!(secure_boot.secure_boot_enable, Some(false));
+
+    let iface = libredfish::BootInterfaceRef::Mac(mac_address::MacAddress::new([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+    ]));
+    assert!(
+        redfish.is_boot_order_setup(iface).await?,
+        "is_boot_order_setup"
+    );
+
+    let no_profiles: libredfish::BiosProfileVendor = Default::default();
+    assert_eq!(
+        redfish
+            .machine_setup(
+                None,
+                &no_profiles,
+                libredfish::BiosProfileType::Performance,
+                &no_profiles,
+            )
+            .await?,
+        None,
+        "machine_setup is a script no-op"
+    );
+
+    // Overrides that PATCH the BMC. The script builds the Boot block itself.
+    redfish.boot_once(libredfish::Boot::Pxe).await?;
+    redfish.boot_first(libredfish::Boot::HardDisk).await?;
+    assert_eq!(
+        redfish
+            .set_boot_override(libredfish::BootOverride {
+                target: libredfish::BootSourceOverrideTarget::UefiHttp,
+                enabled: libredfish::BootSourceOverrideEnabled::Continuous,
+                mode: Some(libredfish::BootSourceOverrideMode::UEFI),
+                http_boot_uri: Some("http://example.invalid/ipxe.efi".to_string()),
+            })
+            .await?,
+        None,
+        "script applies immediately, so no job id"
+    );
+    assert_eq!(redfish.set_boot_order_dpu_first(iface).await?, None);
+
+    // get_chassis, real serials pass through untouched.
+    let chassis = redfish.get_chassis("1").await?;
+    assert_eq!(
+        chassis.serial_number.as_deref(),
+        Some("C8010MM21A30331"),
+        "a real SerialNumber must survive the script"
+    );
+
+    // ...and a chassis with no SerialNumber gets a stable sha256(bmc_address + manager_id).
+    let synthesized = redfish
+        .get_chassis("NVMeSSD.0.Group.0.StorageBackplane")
+        .await?;
+    assert_eq!(
+        synthesized.serial_number.as_deref(),
+        Some(RUNE_SYNTHESIZED_SERIAL),
+        "blank SerialNumber must be replaced by sha256(bmc_address + manager_id)"
+    );
+
+    Ok(())
+}
+
+/// `tests/rune/sushy.rn` replicates the hand written `sushy` vendor as a script.
+/// Only the methods it defines differ, the rest falls back to `RedfishStandard`.
+#[tokio::test]
+async fn rune_sushy_script_overrides_bmc_methods() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("supermicro", RUNE_SUSHY_PORT); // stops on drop
+
+    let script = PathBuf::from(ROOT_DIR).join("tests/rune/sushy.rn");
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{RUNE_SUSHY_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let mut standard = pool.create_standard_client(endpoint)?;
+    standard.set_vendor_script(Some(script.to_string_lossy().into_owned()));
+    // Exercises ctx.vendor_data() with a MAC address keyed UefiDevicePath table,
+    // mirroring what the override file's "data" field carries.
+    standard.set_vendor_data(Some(serde_json::json!({
+        "uefi_device_path_by_mac": {
+            "94:6d:ae:91:fb:22": "UsbClass(0x0,0x0,0x0,0x0,0x0)",
+        }
+    })));
+    let redfish = standard.set_vendor(RedfishVendor::Rune).await?;
+
+    // Overrides that never touch the network. sushy has no BIOS, DPU, or NTP backend.
+    assert!(redfish.is_bios_setup(None).await?, "is_bios_setup");
+    let iface = libredfish::BootInterfaceRef::Mac(mac_address::MacAddress::new([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+    ]));
+    assert!(
+        redfish.is_boot_order_setup(iface).await?,
+        "is_boot_order_setup"
+    );
+
+    let no_profiles: libredfish::BiosProfileVendor = Default::default();
+    assert_eq!(
+        redfish
+            .machine_setup(
+                None,
+                &no_profiles,
+                libredfish::BiosProfileType::Performance,
+                &no_profiles,
+            )
+            .await?,
+        None,
+        "machine_setup is a script no-op"
+    );
+
+    // set_ntp_servers is a script no op, so the standard NTP PATCH never runs and
+    // this succeeds even though the mockup was never taught an NTP payload.
+    redfish
+        .set_ntp_servers(&["ntp1.example".to_string(), "ntp2.example".to_string()])
+        .await?;
+
+    // get_accounts uses expand_collection because the mockup, like vanilla sushy,
+    // ignores $expand, so this proves the per member fetch fallback works.
+    let mut accounts = redfish.get_accounts().await?;
+    accounts.sort();
+    assert_eq!(
+        accounts
+            .iter()
+            .map(|a| a.username.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root", "tests_admin"],
+        "get_accounts should expand both members"
+    );
+
+    // pcie_devices and get_drives_metrics also take expand_collection's fallback,
+    // two levels for drives. Mockup has 8 GPUs plus 10 NICs with 1 disabled.
+    let pcie_devices = redfish.pcie_devices().await?;
+    assert_eq!(
+        pcie_devices.len(),
+        17,
+        "pcie_devices should filter to enabled, identified devices"
+    );
+    assert!(
+        pcie_devices
+            .windows(2)
+            .all(|w| w[0].manufacturer <= w[1].manufacturer),
+        "pcie_devices should be sorted by manufacturer"
+    );
+    assert!(
+        pcie_devices
+            .iter()
+            .any(|d| d.manufacturer.as_deref() == Some("Samsung")),
+        "pcie_devices entries should be fully expanded, not shallow refs"
+    );
+
+    let drives = redfish.get_drives_metrics().await?;
+    assert_eq!(
+        drives.len(),
+        8,
+        "get_drives_metrics should expand all drives"
+    );
+    assert!(
+        drives.iter().any(|d| d.serial_number.is_some()),
+        "drives should be fully expanded, not shallow refs"
+    );
+
+    // ComponentIntegrity isn't in this mockup (matching many real BMCs), so this
+    // just proves a missing collection fails cleanly instead of panicking.
+    assert!(redfish.get_component_integrities().await.is_err());
+
+    // Overrides that PATCH the BMC. The script builds the Boot block itself.
+    redfish.boot_once(libredfish::Boot::Pxe).await?;
+    redfish.boot_first(libredfish::Boot::HardDisk).await?;
+    assert_eq!(
+        redfish
+            .set_boot_override(libredfish::BootOverride {
+                target: libredfish::BootSourceOverrideTarget::UefiHttp,
+                enabled: libredfish::BootSourceOverrideEnabled::Continuous,
+                mode: Some(libredfish::BootSourceOverrideMode::UEFI),
+                http_boot_uri: Some("http://example.invalid/ipxe.efi".to_string()),
+            })
+            .await?,
+        None,
+        "script applies immediately, so no job id"
+    );
+    // sushy has no DPU, so boot order means network boot, preferring UefiHttp. The
+    // mockup always accepts the first PATCH, so only the primary path runs here.
+    assert_eq!(redfish.set_boot_order_dpu_first(iface).await?, None);
+
+    // get_system_ethernet_interface fills vanilla sushy's missing UefiDevicePath
+    // from ctx.vendor_data(), keyed by the MAC of interface "1" in the mockup.
+    let ethernet_interface = redfish.get_system_ethernet_interface("1").await?;
+    assert_eq!(
+        ethernet_interface.uefi_device_path.as_deref(),
+        Some("UsbClass(0x0,0x0,0x0,0x0,0x0)"),
+        "UefiDevicePath should be injected from ctx.vendor_data()"
+    );
+
+    // Vanilla sushy has no BootOptions endpoint, so get_boot_options returns an
+    // always empty stub instead of hitting the network.
+    let boot_options = redfish.get_boot_options().await?;
+    assert!(
+        boot_options.members.is_empty(),
+        "get_boot_options should be an always-empty stub"
+    );
+
+    Ok(())
+}
+
+/// `tests/rune/hw.rn` against a Dell mockup. Every override is gated on the Manager
+/// Oem naming Dell, and the paths below are Oem ones the standard client cannot read.
+#[tokio::test]
+async fn rune_hw_script_reads_dell_oem_paths() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", RUNE_HW_PORT); // stops on drop
+
+    let script = PathBuf::from(ROOT_DIR).join("tests/rune/hw.rn");
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{RUNE_HW_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let mut standard = pool.create_standard_client(endpoint)?;
+    standard.set_vendor_script(Some(script.to_string_lossy().into_owned()));
+    // Pins the boot NIC the BIOS already targets. Without it the script looks for a
+    // cabled port and this mockup reports every interface down, which the next test covers.
+    standard.set_vendor_data(Some(serde_json::json!({
+        "http_boot_nic": "NIC.Slot.5-1",
+    })));
+    let redfish = standard.set_vendor(RedfishVendor::Rune).await?;
+
+    // Jobs live under the Dell Oem path, which the standard implementation cannot read.
+    assert!(
+        matches!(
+            redfish.get_job_state("JID_102241909559").await?,
+            libredfish::JobState::Completed
+        ),
+        "get_job_state should read the job under the Dell Oem path"
+    );
+
+    // BootSeqRetry is the Dell name for retrying the boot sequence forever.
+    assert_eq!(
+        redfish.is_infinite_boot_enabled().await?,
+        Some(true),
+        "is_infinite_boot_enabled should read BootSeqRetry"
+    );
+
+    // Storage holds CPU and AHCI controllers but no BOSS, so the caller must not be
+    // handed a controller id that does not exist.
+    assert_eq!(
+        redfish.get_boss_controller().await?,
+        None,
+        "no BOSS controller in this mockup"
+    );
+
+    // SystemLockdown Disabled paired with Racadm Enabled is fully off, not Partial.
+    // Reaching the pair at all exercises the group and field key match.
+    let lockdown = redfish.lockdown_status().await?;
+    assert!(lockdown.is_fully_disabled(), "lockdown status {lockdown}");
+
+    // Every BIOS attribute machine_setup would write already reads back the same.
+    assert!(redfish.is_bios_setup(None).await?, "is_bios_setup");
+
+    // Boot0000 is the HTTP Device entry and it is already first in BootOrder.
+    let iface = libredfish::BootInterfaceRef::Mac(mac_address::MacAddress::new([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+    ]));
+    assert!(
+        redfish.is_boot_order_setup(iface).await?,
+        "is_boot_order_setup"
+    );
+
+    // BIOS and boot order match, so lockdown being off is the only thing left.
+    let status = redfish.machine_setup_status(None).await?;
+    assert!(!status.is_done, "lockdown is off, so setup is not done");
+    let keys: Vec<&str> = status.diffs.iter().map(|d| d.key.as_str()).collect();
+    assert_eq!(keys, vec!["lockdown"], "only lockdown should differ");
+
+    Ok(())
+}
+
+/// With no pinned NIC the script has to find a cabled port the BIOS registry accepts.
+/// This mockup reports every interface down, so setup must report why instead of guessing.
+#[tokio::test]
+async fn rune_hw_script_without_a_pinned_boot_nic() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("dell", RUNE_HW_NO_NIC_PORT); // stops on drop
+
+    let script = PathBuf::from(ROOT_DIR).join("tests/rune/hw.rn");
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{RUNE_HW_NO_NIC_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let mut standard = pool.create_standard_client(endpoint)?;
+    standard.set_vendor_script(Some(script.to_string_lossy().into_owned()));
+    // No vendor data, so http_boot_nic is absent and the port has to be discovered.
+    let redfish = standard.set_vendor(RedfishVendor::Rune).await?;
+
+    assert!(
+        !redfish.is_bios_setup(None).await?,
+        "no boot nic means not set up, whatever the BIOS already holds"
+    );
+
+    let status = redfish.machine_setup_status(None).await?;
+    assert!(!status.is_done, "setup cannot be done without a boot nic");
+    let keys: Vec<&str> = status.diffs.iter().map(|d| d.key.as_str()).collect();
+    assert!(
+        keys.contains(&"boot_slot"),
+        "diffs should name the missing nic, got {keys:?}"
+    );
+
+    Ok(())
+}
+
+/// Vanilla sushy 404s PCIeDevices and its chassis id is not the system id, which is
+/// fatal to fetch_pcie_devices. GB200 reproduces that, it has no `Chassis/System_0`.
+#[tokio::test]
+async fn rune_sushy_script_tolerates_missing_pcie_devices() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("nvidia_gb200", RUNE_SUSHY_NO_PCIE_PORT); // stops on drop
+
+    let script = PathBuf::from(ROOT_DIR).join("tests/rune/sushy.rn");
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{RUNE_SUSHY_NO_PCIE_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let mut standard = pool.create_standard_client(endpoint)?;
+    standard.set_vendor_script(Some(script.to_string_lossy().into_owned()));
+    let redfish = standard.set_vendor(RedfishVendor::Rune).await?;
+
+    assert!(
+        redfish.pcie_devices().await?.is_empty(),
+        "a missing PCIeDevices collection should yield empty, not an error"
+    );
+
+    Ok(())
+}
+
+/// A directly built Rune client resolves its own ids, so it has to land on the same
+/// host as the pool. GB200 lists a `System_0` plus an auxiliary board with no Bios.
+#[tokio::test]
+async fn rune_resolves_host_ids_on_a_multi_system_bmc() -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server("nvidia_gb200", RUNE_RESOLVE_IDS_PORT); // stops on drop
+
+    // generic.rn overrides neither get_system nor get_manager, so both fall through
+    // to the standard implementation and report the ids resolve_ids settled on.
+    let script = PathBuf::from(ROOT_DIR).join("tests/rune/generic.rn");
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{RUNE_RESOLVE_IDS_PORT}"),
+        ..Default::default()
+    };
+    let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
+        .build()?;
+    let mut standard = pool.create_standard_client(endpoint)?;
+    standard.set_vendor_script(Some(script.to_string_lossy().into_owned()));
+    // Neither id is set, so the first dispatch below runs resolve_ids.
+    let redfish = standard.set_vendor(RedfishVendor::Rune).await?;
+
+    assert_eq!(
+        redfish.get_system().await?.id,
+        "System_0",
+        "should target the Bios-bearing host system, not HGX_Baseboard_0"
+    );
+    assert_eq!(
+        redfish.get_manager().await?.id,
+        "BMC_0",
+        "should follow the host system's ManagedBy link"
+    );
+
+    Ok(())
 }
