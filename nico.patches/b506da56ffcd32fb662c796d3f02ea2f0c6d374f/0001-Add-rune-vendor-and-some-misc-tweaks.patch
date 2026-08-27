@@ -1,0 +1,875 @@
+From 43ac68cd4b5777f233d114454d5f558f740165ed Mon Sep 17 00:00:00 2001
+From: s3rj1k <evasive.gyron@gmail.com>
+Date: Wed, 24 Jun 2026 12:13:15 +0200
+Subject: [PATCH 1/2] Add `rune` vendor and some misc tweaks
+
+Signed-off-by: s3rj1k <evasive.gyron@gmail.com>
+---
+ .taplo.toml                                   |   7 +-
+ Cargo.lock                                    | 195 +++++++++++++++++-
+ Cargo.toml                                    |   3 +-
+ Makefile.toml                                 |   9 +-
+ crates/api-core/src/cfg/README.md             |   2 +-
+ crates/api-core/src/cfg/file.rs               |   6 +-
+ crates/api-core/src/ipxe.rs                   |   8 +-
+ crates/api/files/bf.cfg                       |  25 +++
+ crates/machine-controller/Cargo.toml          |   4 +-
+ crates/network/Cargo.toml                     |  24 ++-
+ crates/redfish/src/libredfish/conv.rs         |   1 +
+ crates/redfish/src/libredfish/mod.rs          |   5 +-
+ .../src/bmc_endpoint_explorer.rs              |   3 +-
+ crates/site-explorer/src/config.rs            |   2 +-
+ crates/ufm-mock/Cargo.toml                    |   5 +-
+ crates/xtask/Cargo.toml                       |  17 +-
+ .../api/config-files/carbide-api-config.toml  |   4 +-
+ docs/.rumdl.toml                              |  54 +++--
+ pxe/Makefile.toml                             |  26 +--
+ .../qcow-imager-aarch64/mkosi.conf            |   4 +-
+ pxe/mkosi.profiles/qcow-imager/mkosi.conf     |   5 +-
+ .../scout-loader-x86_64/mkosi.conf            |   1 +
+ 22 files changed, 325 insertions(+), 85 deletions(-)
+
+diff --git a/.taplo.toml b/.taplo.toml
+index d930c7cfb..fbc0eaf85 100644
+--- a/.taplo.toml
++++ b/.taplo.toml
+@@ -14,4 +14,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ #
+-exclude = ["pxe/mkosi/**"]
++exclude = [
++  "pxe/mkosi/**",
++  # Go-templated config files rendered by Helm; not valid standalone TOML.
++  "helm/charts/nico-api/files/carbide-api-config.toml",
++  "helm/charts/nico-bmc-proxy/files/carbide-bmc-proxy.toml",
++]
+diff --git a/Cargo.lock b/Cargo.lock
+index 9f442533d..55fd1597a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3771,6 +3771,16 @@ version = "0.5.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+ 
++[[package]]
++name = "codespan-reporting"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3538270d33cc669650c4b093848450d380def10c331d38c768e34cac80576e6e"
++dependencies = [
++ "termcolor",
++ "unicode-width 0.1.14",
++]
++
+ [[package]]
+ name = "color-eyre"
+ version = "0.6.5"
+@@ -6925,17 +6935,20 @@ dependencies = [
+ [[package]]
+ name = "libredfish"
+ version = "0.0.0"
+-source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.46.7#97be4e1722e94a77d4278522d7664be5ba381d92"
++source = "git+https://github.com/s3rj1k/libredfish-rune.git?branch=feat%2Frune#369342b87402765eb38e51e8e34347497d7149c7"
+ dependencies = [
++ "base64",
+  "chrono",
+  "clap",
+  "log",
+  "mac_address",
+  "regex",
+  "reqwest 0.12.28",
++ "rune",
+  "serde",
+  "serde_json",
+  "serde_with",
++ "sha2 0.10.9",
+  "thiserror 1.0.69",
+  "tokio",
+  "tracing",
+@@ -7481,6 +7494,38 @@ version = "0.10.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+ 
++[[package]]
++name = "musli"
++version = "0.0.124"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8b310b280353d9e1c92861820321f8742b02666acaf984a29cd8946965444384"
++dependencies = [
++ "loom",
++ "musli-core",
++ "serde",
++ "simdutf8",
++]
++
++[[package]]
++name = "musli-core"
++version = "0.0.124"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d00e227a374e92550ce2eb5002ae116e02a43926d7243c95997138406ae4e157"
++dependencies = [
++ "musli-macros",
++]
++
++[[package]]
++name = "musli-macros"
++version = "0.0.124"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7427c9aa85c882cd4dbe712d2fcdc511db05d595f7787e6747c90cd7d67efc4"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.117",
++]
++
+ [[package]]
+ name = "names"
+ version = "0.14.0"
+@@ -7782,6 +7827,20 @@ dependencies = [
+  "windows-sys 0.61.2",
+ ]
+ 
++[[package]]
++name = "num"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
++dependencies = [
++ "num-bigint",
++ "num-complex",
++ "num-integer",
++ "num-iter",
++ "num-rational",
++ "num-traits",
++]
++
+ [[package]]
+ name = "num-bigint"
+ version = "0.4.6"
+@@ -7808,6 +7867,15 @@ dependencies = [
+  "zeroize",
+ ]
+ 
++[[package]]
++name = "num-complex"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
++dependencies = [
++ "num-traits",
++]
++
+ [[package]]
+ name = "num-conv"
+ version = "0.2.2"
+@@ -7845,6 +7913,17 @@ dependencies = [
+  "num-traits",
+ ]
+ 
++[[package]]
++name = "num-rational"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
++dependencies = [
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++]
++
+ [[package]]
+ name = "num-traits"
+ version = "0.2.19"
+@@ -9903,6 +9982,99 @@ dependencies = [
+  "tokio-util",
+ ]
+ 
++[[package]]
++name = "rune"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a577a0dc4b3e4cfe89247325b14b5f30096ddc82fa51fffb1d823fbc85b410"
++dependencies = [
++ "anyhow",
++ "codespan-reporting",
++ "futures-core",
++ "futures-util",
++ "itoa",
++ "memchr",
++ "musli",
++ "num",
++ "once_cell",
++ "pin-project",
++ "rune-alloc",
++ "rune-core",
++ "rune-macros",
++ "rune-tracing",
++ "ryu",
++ "serde",
++ "syntree",
++ "unicode-ident",
++]
++
++[[package]]
++name = "rune-alloc"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "702abcb136e7e4ff61c29006f018ab535728388b950bfbd50a0a66d7a2db1ff6"
++dependencies = [
++ "ahash 0.8.12",
++ "pin-project",
++ "rune-alloc-macros",
++ "serde",
++]
++
++[[package]]
++name = "rune-alloc-macros"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "98fa2ddc4ebb390a257f05659081e5f4a1419ca65f0c7a3f4b02547860dd93f4"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.117",
++]
++
++[[package]]
++name = "rune-core"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8fab02420e2189ad2d8d9efceca5319782873eb547c61b68732746cc161547aa"
++dependencies = [
++ "musli",
++ "rune-alloc",
++ "serde",
++ "twox-hash",
++]
++
++[[package]]
++name = "rune-macros"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d314f34d8b30569189d90ac0f96eeedf629492c10d18146b40cfb76bd3fd2d52"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "rune-core",
++ "syn 2.0.117",
++]
++
++[[package]]
++name = "rune-tracing"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f5b903935dfcb0ab9eec395f4c2e04b174448bb8d1fd35ef5181ad67140239a9"
++dependencies = [
++ "rune-tracing-macros",
++]
++
++[[package]]
++name = "rune-tracing-macros"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "75193c702bddd8a5b74b1f9a5a992cef3c6b2df2909d6f0bb0f4b0f3ec8a2f66"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.117",
++]
++
+ [[package]]
+ name = "russh"
+ version = "0.62.4"
+@@ -11390,6 +11562,12 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
++[[package]]
++name = "syntree"
++version = "0.18.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "00c99c9cda412afe293a6b962af651b4594161ba88c1affe7ef66459ea040a06"
++
+ [[package]]
+ name = "system-configuration"
+ version = "0.7.0"
+@@ -11514,6 +11692,15 @@ dependencies = [
+  "winapi",
+ ]
+ 
++[[package]]
++name = "termcolor"
++version = "1.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
++dependencies = [
++ "winapi-util",
++]
++
+ [[package]]
+ name = "terminfo"
+ version = "0.9.0"
+@@ -12352,6 +12539,12 @@ dependencies = [
+  "target-lexicon",
+ ]
+ 
++[[package]]
++name = "twox-hash"
++version = "2.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
++
+ [[package]]
+ name = "typed-builder"
+ version = "0.23.2"
+diff --git a/Cargo.toml b/Cargo.toml
+index 0394b6434..19a409248 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,7 +27,8 @@ repository = "https://github.com/NVIDIA/infra-controller"
+ 
+ [workspace.dependencies]
+ clap = { version = "4", features = ["derive", "env"] }
+-libredfish = { git = "https://github.com/NVIDIA/libredfish.git", tag = "v0.46.7" }
++# Fork of NVIDIA/libredfish v0.46.7 plus the `rune` scripted vendor.
++libredfish = { git = "https://github.com/s3rj1k/libredfish-rune.git", branch = "feat/rune" }
+ librms = { git = "https://github.com/dsx-ai-factory/nv-rms-client.git", tag = "v0.10.1" }
+ ansi-to-html = "0.2.2"
+ 
+diff --git a/Makefile.toml b/Makefile.toml
+index f37c42e67..d3573b022 100644
+--- a/Makefile.toml
++++ b/Makefile.toml
+@@ -717,10 +717,7 @@ dependencies = [
+ [tasks.test-release-container-services]
+ workspace = false
+ command = "cargo"
+-args = [
+-  "test",
+-  "--profile=ci-tests",
+-]
++args = ["test", "--profile=ci-tests"]
+ 
+ [tasks.build-and-test-release-container-services]
+ workspace = false
+@@ -731,8 +728,8 @@ workspace = false
+ # called by CI. If necessary separate tasks can be defined for workflows which
+ # do not require everything.
+ dependencies = [
+-  "build-release", # Start with release builds, since some artifacts are used in integration tests
+-  "test-flow",     # Then run all tests
++  "build-release",                                      # Start with release builds, since some artifacts are used in integration tests
++  "test-flow",                                          # Then run all tests
+   "check-aarch64-release-container-services-page-size",
+ ]
+ 
+diff --git a/crates/api-core/src/cfg/README.md b/crates/api-core/src/cfg/README.md
+index b61503908..22aa1f099 100644
+--- a/crates/api-core/src/cfg/README.md
++++ b/crates/api-core/src/cfg/README.md
+@@ -422,7 +422,7 @@ shipped configuration selects a plaintext mode.
+ | `power_shelves_created_per_run` | `u64` | `1` | Max power shelves created per run. |
+ | `create_switches` | `bool` | `true` | Auto-create Switch state machines for explored switches with a matching `expected_switches` record. |
+ | `switches_created_per_run` | `u64` | `9` | Max switches created per run. |
+-| `explore_mode` | `SiteExplorerExploreMode` | `NvRedfish` | Redfish backend: `libredfish`, `nv-redfish`, or `compare-result`. |
++| `explore_mode` | `SiteExplorerExploreMode` | `LibRedfish` | Redfish backend: `libredfish`, `nv-redfish`, or `compare-result`. |
+ | `dpu_policy` | `Option<HostDpuPolicy>` | — (effective: `manage`) | Site-wide policy for DPU hardware: `manage`, `nic`, or `ignore`. Per-host `nic` and `ignore` override it; per-host `manage` inherits it for backward compatibility. When omitted, the site default is `manage`. The previous `use_as_nic` value and the legacy `dpu_mode` field with `dpu_mode` / `nic_mode` / `no_dpu` values remain accepted during deserialization. |
+ 
+ ### `StateControllerConfig`
+diff --git a/crates/api-core/src/cfg/file.rs b/crates/api-core/src/cfg/file.rs
+index 43eeb9df6..89b3d3130 100644
+--- a/crates/api-core/src/cfg/file.rs
++++ b/crates/api-core/src/cfg/file.rs
+@@ -5298,7 +5298,7 @@ mod tests {
+                 rotate_switch_nvos_credentials: Arc::new(false.into()),
+                 dpu_policy: None,
+                 deprecated_force_dpu_nic_mode: None,
+-                explore_mode: SiteExplorerExploreMode::NvRedfish,
++                explore_mode: SiteExplorerExploreMode::LibRedfish,
+             }
+         );
+         assert_eq!(
+@@ -5658,7 +5658,7 @@ mod tests {
+                 rotate_switch_nvos_credentials: Arc::new(false.into()),
+                 dpu_policy: None,
+                 deprecated_force_dpu_nic_mode: None,
+-                explore_mode: SiteExplorerExploreMode::NvRedfish,
++                explore_mode: SiteExplorerExploreMode::LibRedfish,
+             }
+         );
+ 
+@@ -6047,7 +6047,7 @@ mod tests {
+                 rotate_switch_nvos_credentials: Arc::new(false.into()),
+                 dpu_policy: None,
+                 deprecated_force_dpu_nic_mode: None,
+-                explore_mode: SiteExplorerExploreMode::NvRedfish,
++                explore_mode: SiteExplorerExploreMode::LibRedfish,
+             }
+         );
+ 
+diff --git a/crates/api-core/src/ipxe.rs b/crates/api-core/src/ipxe.rs
+index 2b8062d42..44f1ecbb0 100644
+--- a/crates/api-core/src/ipxe.rs
++++ b/crates/api-core/src/ipxe.rs
+@@ -210,7 +210,9 @@ impl PxeInstructions {
+                 if machine_type == MachineType::Host || machine_type == MachineType::PredictedHost {
+                     InstructionGenerator {
+                         kernel: "${base-url}/internal/aarch64/scout.efi".to_string(),
+-                        command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url]"),
++                        // newrootfs points scout-loader-rclocal at this env's squashfs blob host.
++                        // Without it, falls back to a hardcoded carbide-static-pxe.forge hostname.
++                        command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url] newrootfs=${{base-url}}/internal/aarch64/scout.squashfs"),
+                         initrd: None,
+                     }
+                 }
+@@ -226,7 +228,9 @@ impl PxeInstructions {
+             rpc::MachineArchitecture::X86 => {
+                 InstructionGenerator {
+                     kernel: "${base-url}/internal/x86_64/scout.efi".to_string(),
+-                    command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url]"),
++                    // newrootfs points scout-loader-rclocal at this env's squashfs blob host.
++                    // Without it, falls back to a hardcoded carbide-static-pxe.forge hostname.
++                    command_line: format!("mac={mac_address} console=tty0 console={console},115200 pci=realloc=off iommu=off cli_cmd=auto-detect machine_id={machine_interface_id} server_uri=[api_url] pxe_uri=[pxe_url] newrootfs=${{base-url}}/internal/x86_64/scout.squashfs"),
+                     initrd: None,
+                 }
+             }
+diff --git a/crates/api/files/bf.cfg b/crates/api/files/bf.cfg
+index 284f9b70d..0195e99e8 100644
+--- a/crates/api/files/bf.cfg
++++ b/crates/api/files/bf.cfg
+@@ -644,6 +644,30 @@ write_files:
+ 
+         [Install]
+         WantedBy=multi-user.target
++  - path: /etc/systemd/system/forge-dpu-mst-init.service
++    permissions: '0644'
++    content: |
++      [Unit]
++      Description=Re-init Mellanox mst nodes once before forge-dpu-agent
++      # mst_pciconf goes stale across the platform power-cycle (flint: "Missing
++      # DPU info"). Run once here, not as a forge-dpu-agent ExecStartPre that
++      # re-runs on every Restart= and bounces the oob NIC mid-operation.
++      Before=network-online.target forge-dpu-agent.service
++
++      [Service]
++      Type=oneshot
++      RemainAfterExit=yes
++      ExecStart=-/usr/bin/mst restart
++
++      [Install]
++      WantedBy=multi-user.target
++  - path: /etc/systemd/system/forge-dpu-agent.service.d/10-mst-init.conf
++    permissions: '0644'
++    content: |
++      # Wait for the one-shot mst re-init; it runs once, no per-restart bounce.
++      [Unit]
++      Wants=forge-dpu-mst-init.service
++      After=forge-dpu-mst-init.service
+ {% raw %}
+   - path: /etc/systemd/system/kubelet.service.d/10-bf.conf
+     permissions: '0644'
+@@ -731,6 +755,7 @@ runcmd:
+   - [ systemctl, mask, kubelet.service ]
+   - [ systemctl, enable, dpf-vrf-routes.service ]
+   - [ systemctl, enable, dpf-br-mgmt-routes.service ]
++  - [ systemctl, enable, forge-dpu-mst-init.service ]
+   - [ systemctl, enable, kubeadm-join.service ]
+   - [ bash, -c, '/opt/forge/runcmds.sh' ]
+ EOF
+diff --git a/crates/machine-controller/Cargo.toml b/crates/machine-controller/Cargo.toml
+index 7e737dad6..4d566da2d 100644
+--- a/crates/machine-controller/Cargo.toml
++++ b/crates/machine-controller/Cargo.toml
+@@ -78,7 +78,9 @@ uuid = { workspace = true, features = ["v4", "serde"] }
+ version-compare = { workspace = true }
+ 
+ [dev-dependencies]
+-carbide-api-model = { path = "../api-model", default-features = false, features = ["test-support"] }
++carbide-api-model = { path = "../api-model", default-features = false, features = [
++  "test-support",
++] }
+ carbide-instrument = { path = "../instrument", features = ["test-support"] }
+ carbide-redfish = { path = "../redfish", features = ["test-support"] }
+ carbide-secrets = { path = "../secrets", features = ["test-support"] }
+diff --git a/crates/network/Cargo.toml b/crates/network/Cargo.toml
+index 321a5e2ab..c38b0fcf3 100644
+--- a/crates/network/Cargo.toml
++++ b/crates/network/Cargo.toml
+@@ -38,15 +38,15 @@ ipnetwork = { workspace = true, features = ["serde"], optional = true }
+ mac_address = { workspace = true }
+ serde = { features = ["derive"], workspace = true }
+ sqlx = { workspace = true, features = [
+-    "tls-rustls",
+-    "mac_address",
+-    "ipnetwork",
+-    "uuid",
+-    "migrate",
+-    "postgres",
+-    "chrono",
+-    "macros",
+-    "json",
++  "tls-rustls",
++  "mac_address",
++  "ipnetwork",
++  "uuid",
++  "migrate",
++  "postgres",
++  "chrono",
++  "macros",
++  "json",
+ ], optional = true }
+ thiserror = { workspace = true }
+ 
+@@ -55,7 +55,11 @@ carbide-test-support = { path = "../test-support" }
+ carbide-macros = { path = "../macros" }
+ carbide-sqlx-testing = { path = "../sqlx-testing", default-features = false }
+ serde_json = { workspace = true }
+-sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
++sqlx = { workspace = true, features = [
++  "runtime-tokio",
++  "tls-rustls",
++  "postgres",
++] }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/redfish/src/libredfish/conv.rs b/crates/redfish/src/libredfish/conv.rs
+index 4377bffdb..a7e5258fa 100644
+--- a/crates/redfish/src/libredfish/conv.rs
++++ b/crates/redfish/src/libredfish/conv.rs
+@@ -167,6 +167,7 @@ pub fn bmc_vendor(r: libredfish::model::service_root::RedfishVendor) -> BMCVendo
+         RedfishVendor::DeltaPowerShelf => BMCVendor::Delta,
+         RedfishVendor::Supermicro => BMCVendor::Supermicro,
+         RedfishVendor::Unknown => BMCVendor::Unknown,
++        RedfishVendor::Rune => BMCVendor::Unknown,
+     }
+ }
+ 
+diff --git a/crates/redfish/src/libredfish/mod.rs b/crates/redfish/src/libredfish/mod.rs
+index f501741fa..0337de047 100644
+--- a/crates/redfish/src/libredfish/mod.rs
++++ b/crates/redfish/src/libredfish/mod.rs
+@@ -443,7 +443,10 @@ pub trait RedfishClientPool: Send + Sync + 'static {
+                     }
+                 }
+             }
+-            RedfishVendor::Supermicro | RedfishVendor::Dell | RedfishVendor::Hpe => {
++            RedfishVendor::Supermicro
++            | RedfishVendor::Dell
++            | RedfishVendor::Hpe
++            | RedfishVendor::Rune => {
+                 client
+                     .change_password(curr_user.as_str(), new_password.as_str())
+                     .await
+diff --git a/crates/site-explorer/src/bmc_endpoint_explorer.rs b/crates/site-explorer/src/bmc_endpoint_explorer.rs
+index b545fc9ea..0ee0eefec 100644
+--- a/crates/site-explorer/src/bmc_endpoint_explorer.rs
++++ b/crates/site-explorer/src/bmc_endpoint_explorer.rs
+@@ -1800,8 +1800,7 @@ mod tests {
+             bmc_mock::tls::server_config(None::<&str>).unwrap(),
+         );
+ 
+-        let mode = crate::config::SiteExplorerConfig::default_explore_mode();
+-        assert_eq!(mode, SiteExplorerExploreMode::NvRedfish);
++        let mode = SiteExplorerExploreMode::NvRedfish;
+         let proxy_address = Arc::new(ArcSwap::new(Arc::new(None)));
+         let explorer = BmcEndpointExplorer::new(
+             Arc::new(RedfishSim::default()),
+diff --git a/crates/site-explorer/src/config.rs b/crates/site-explorer/src/config.rs
+index bbd977793..02b28a50c 100644
+--- a/crates/site-explorer/src/config.rs
++++ b/crates/site-explorer/src/config.rs
+@@ -331,7 +331,7 @@ impl SiteExplorerConfig {
+     }
+ 
+     pub const fn default_explore_mode() -> SiteExplorerExploreMode {
+-        SiteExplorerExploreMode::NvRedfish
++        SiteExplorerExploreMode::LibRedfish
+     }
+ }
+ 
+diff --git a/crates/ufm-mock/Cargo.toml b/crates/ufm-mock/Cargo.toml
+index 963b739b8..f13cd4d68 100644
+--- a/crates/ufm-mock/Cargo.toml
++++ b/crates/ufm-mock/Cargo.toml
+@@ -41,7 +41,10 @@ figment = { features = ["toml"], workspace = true }
+ futures = { workspace = true }
+ metrics-endpoint = { path = "../metrics-endpoint" }
+ opentelemetry = { workspace = true }
+-reqwest = { default-features = false, features = ["json", "rustls"], workspace = true }
++reqwest = { default-features = false, features = [
++  "json",
++  "rustls",
++], workspace = true }
+ serde = { features = ["derive"], workspace = true }
+ serde_json = { workspace = true }
+ thiserror = { workspace = true }
+diff --git a/crates/xtask/Cargo.toml b/crates/xtask/Cargo.toml
+index 64f165468..5790962c2 100644
+--- a/crates/xtask/Cargo.toml
++++ b/crates/xtask/Cargo.toml
+@@ -31,16 +31,23 @@ clap = { workspace = true }
+ cargo_metadata = { workspace = true }
+ similar = { workspace = true }
+ version-compare = { workspace = true }
+-syn = { workspace = true, features = ["full", "visit", "parsing", "extra-traits", "clone-impls", "printing"] }
++syn = { workspace = true, features = [
++  "full",
++  "visit",
++  "parsing",
++  "extra-traits",
++  "clone-impls",
++  "printing",
++] }
+ proc-macro2 = { workspace = true, features = ["proc-macro", "span-locations"] }
+ 
+ chrono = { workspace = true }
+ tracing = { workspace = true }
+ sqlx = { workspace = true, features = [
+-    "runtime-tokio",
+-    "tls-rustls",
+-    "postgres",
+-    "migrate",
++  "runtime-tokio",
++  "tls-rustls",
++  "postgres",
++  "migrate",
+ ] }
+ tokio = { workspace = true }
+ 
+diff --git a/deploy/nico-base/api/config-files/carbide-api-config.toml b/deploy/nico-base/api/config-files/carbide-api-config.toml
+index 588332d01..f64edfed5 100644
+--- a/deploy/nico-base/api/config-files/carbide-api-config.toml
++++ b/deploy/nico-base/api/config-files/carbide-api-config.toml
+@@ -26,8 +26,8 @@ database_url = "postgres://replaced-by-env-var"
+ asn = 4294967000
+ initial_dpu_agent_upgrade_policy = "up_only"
+ max_concurrent_machine_updates = 10
+-dhcp_servers = []                                                                                                     # Added in per-site-configuration
+-route_servers = []                                                                                                    # Required for FNN. Not yet used
++dhcp_servers = []                               # Added in per-site-configuration
++route_servers = []                              # Required for FNN. Not yet used
+ attestation_enabled = true
+ bypass_rbac = true
+ 
+diff --git a/docs/.rumdl.toml b/docs/.rumdl.toml
+index cdf32abfb..ae80b1957 100644
+--- a/docs/.rumdl.toml
++++ b/docs/.rumdl.toml
+@@ -13,11 +13,7 @@
+ [global]
+ # List of rules to disable
+ # disable = ["MD014", "MD033", "MD036"]
+-disable = [
+-  "commands-show-output",
+-  "no-inline-html",
+-  "no-emphasis-as-heading",
+-]
++disable = ["commands-show-output", "no-inline-html", "no-emphasis-as-heading"]
+ 
+ # List of rules to enable exclusively (replaces defaults; only these rules will run)
+ # enable = ["MD001", "MD003", "MD004"]
+@@ -38,18 +34,18 @@ disable = [
+ 
+ # List of file/directory patterns to exclude from linting
+ exclude = [
+-    # Common directories to exclude
+-    ".git",
+-    ".github",
+-    ".gitlab",
+-    "node_modules",
+-    "vendor",
+-    "dist",
+-    "build",
+-
+-    # Specific files or patterns
+-    "CHANGELOG.md",
+-    "LICENSE.md",
++  # Common directories to exclude
++  ".git",
++  ".github",
++  ".gitlab",
++  "node_modules",
++  "vendor",
++  "dist",
++  "build",
++
++  # Specific files or patterns
++  "CHANGELOG.md",
++  "LICENSE.md",
+ ]
+ 
+ # Respect .gitignore files when scanning directories (default: true)
+@@ -65,8 +61,10 @@ flavor = "mdx"
+ 
+ # Disable specific rules for specific files
+ [per-file-ignores]
+-"**/snippets/**/*.mdx" = ["MD041"]  # Snippets don't need to start with an H1
+-"fern/changelog/*.mdx" = ["MD041"]  # Changelog entries don't need to start with an H1
++"**/snippets/**/*.mdx" = ["MD041"] # Snippets don't need to start with an H1
++"fern/changelog/*.mdx" = [
++  "MD041",
++] # Changelog entries don't need to start with an H1
+ 
+ # Rule-specific configurations
+ 
+@@ -88,11 +86,11 @@ strict = false
+ 
+ [MD010]
+ # no-hard-tabs
+-spaces-per-tab = 4  # Number of spaces to replace each tab with (default: 4)
++spaces-per-tab = 4 # Number of spaces to replace each tab with (default: 4)
+ 
+ [MD013]
+ # line-length
+-line-length = 100000      # make sure paragraph-length lines are allowed
++line-length = 100000 # make sure paragraph-length lines are allowed
+ # line-length = 100
+ # reflow = true
+ # reflow-mode = "normalize"
+@@ -102,10 +100,10 @@ line-length = 100000      # make sure paragraph-length lines are allowed
+ siblings_only = true
+ 
+ [MD025]
+-level = 1                        # The heading level that should be unique (default: 1)
+-front-matter-title = "title"     # Regex pattern to match title in YAML front matter (default: "title")
+-allow-document-sections = true  # Allow multiple H1s separated by --- thematic breaks (default: false)
+-allow-with-separators = true    # Allow multiple H1s as document section titles (default: false)
++level = 1                      # The heading level that should be unique (default: 1)
++front-matter-title = "title"   # Regex pattern to match title in YAML front matter (default: "title")
++allow-document-sections = true # Allow multiple H1s separated by --- thematic breaks (default: false)
++allow-with-separators = true   # Allow multiple H1s as document section titles (default: false)
+ 
+ [MD029]
+ # ol-prefix
+@@ -138,7 +136,7 @@ style = "backtick"
+ [MD054]
+ # link-image-style
+ # default is all true
+-autolink = false    # Allow <https://example.com>
++autolink = false # Allow <https://example.com>
+ # inline = true       # Allow [text](url) and ![alt](url)
+ # full = true         # Allow [text][ref] with separate [ref]: url definition
+ # collapsed = true    # Allow [text][] with separate [text]: url definition
+@@ -155,8 +153,8 @@ style = "compact"
+ 
+ [MD076]
+ # list-item-spacing
+-style = "consistent"              # "consistent" (default), "loose", or "tight"
+-allow-loose-continuation = true  # allow blank lines around continuation paragraphs
++style = "consistent"            # "consistent" (default), "loose", or "tight"
++allow-loose-continuation = true # allow blank lines around continuation paragraphs
+ 
+ [MD077]
+ # list-continuation-indent
+diff --git a/pxe/Makefile.toml b/pxe/Makefile.toml
+index ba6a8edc9..653701b7d 100644
+--- a/pxe/Makefile.toml
++++ b/pxe/Makefile.toml
+@@ -20,7 +20,9 @@ REPO_ROOT = { script = [
+ ] }
+ PKG_VERSION = { script = [
+   "if [ -n \"$VERSION\" ]; then echo \"$VERSION\" | sed 's/^v//'; else v=$(git describe --tags --first-parent --always --long | sed 's/^v//'); case \"$v\" in [0-9]*) echo \"$v\" ;; *) echo \"0.0.0-$v\" ;; esac; fi",
+-], condition = { env_not_set = ["PKG_VERSION"] } }
++], condition = { env_not_set = [
++  "PKG_VERSION",
++] } }
+ FORGE_CA_PATH = { value = "${REPO_ROOT}/dev/forge_prodroot.pem" }
+ 
+ # Where mkosi keeps downloaded distro packages. Without this mkosi re-downloads
+@@ -28,7 +30,9 @@ FORGE_CA_PATH = { value = "${REPO_ROOT}/dev/forge_prodroot.pem" }
+ # in CI. Purely a download cache -- mkosi still revalidates package metadata, so
+ # a stale entry cannot silently change what lands in the image. CI persists this
+ # across runs with actions/cache; locally it just makes rebuilds faster.
+-MKOSI_PACKAGE_CACHE_DIR = { value = "${REPO_ROOT}/pxe/.mkosi-package-cache", condition = { env_not_set = ["MKOSI_PACKAGE_CACHE_DIR"] } }
++MKOSI_PACKAGE_CACHE_DIR = { value = "${REPO_ROOT}/pxe/.mkosi-package-cache", condition = { env_not_set = [
++  "MKOSI_PACKAGE_CACHE_DIR",
++] } }
+ 
+ # BlueField Bundle (BFB) Version
+ # NOTE: Update `crates/api/src/cfg/file.rs` to set the DOCA BFB component versions (BMC, NIC, CEC fw)
+@@ -224,11 +228,7 @@ run_task = "internal-bfb-aarch64-sa"
+ [tasks.ipxe-aarch64-sa]
+ category = "iPXE Kernel"
+ description = "Build iPXE kernel for aarch64 (EFI) for SA builds"
+-dependencies = [
+-  "ipxe-config",
+-  "ipxe-patch-mlnx",
+-  "ipxe-install-efi-aarch64",
+-]
++dependencies = ["ipxe-config", "ipxe-patch-mlnx", "ipxe-install-efi-aarch64"]
+ 
+ 
+ [tasks.build-boot-artifacts-bfb]
+@@ -693,20 +693,12 @@ dependencies = ["ipxe-build-efi-x86_64"]
+ [tasks.ipxe-aarch64]
+ category = "iPXE Kernel"
+ description = "Build iPXE kernel for aarch64 (EFI) and move to the carbide static webroot"
+-dependencies = [
+-  "ipxe-config",
+-  "ipxe-patch-mlnx",
+-  "ipxe-install-efi-aarch64",
+-]
++dependencies = ["ipxe-config", "ipxe-patch-mlnx", "ipxe-install-efi-aarch64"]
+ 
+ [tasks.ipxe-aarch64-ci]
+ category = "iPXE Kernel"
+ description = "Build iPXE kernel for aarch64 (EFI) and move to the carbide static webroot"
+-dependencies = [
+-  "ipxe-config",
+-  "ipxe-patch-mlnx",
+-  "ipxe-install-efi-aarch64-ci",
+-]
++dependencies = ["ipxe-config", "ipxe-patch-mlnx", "ipxe-install-efi-aarch64-ci"]
+ 
+ [tasks.ipxe-install-efi-aarch64]
+ category = "iPXE Kernel"
+diff --git a/pxe/mkosi.profiles/qcow-imager-aarch64/mkosi.conf b/pxe/mkosi.profiles/qcow-imager-aarch64/mkosi.conf
+index 3711993a5..efbe36dff 100644
+--- a/pxe/mkosi.profiles/qcow-imager-aarch64/mkosi.conf
++++ b/pxe/mkosi.profiles/qcow-imager-aarch64/mkosi.conf
+@@ -31,7 +31,9 @@ Packages=
+      keyboard-configuration
+      libargtable2-0
+      libudev-dev
+-     linux-image-virtual
++     # Keep the kernel aligned with the scout profiles, the imager needs the same
++     # drivers to reach the network.
++     linux-nvidia-64k-hwe-24.04
+      lshw
+      lvm2
+      mstflint
+diff --git a/pxe/mkosi.profiles/qcow-imager/mkosi.conf b/pxe/mkosi.profiles/qcow-imager/mkosi.conf
+index 36b67480e..bab565b26 100644
+--- a/pxe/mkosi.profiles/qcow-imager/mkosi.conf
++++ b/pxe/mkosi.profiles/qcow-imager/mkosi.conf
+@@ -30,7 +30,10 @@ Packages=
+      keyboard-configuration
+      libargtable2-0
+      libudev-dev
+-     linux-image-virtual
++     # Keep the kernel aligned with the scout profiles, the imager needs the same
++     # drivers to reach the network.
++     linux-image-6.8.0-111-generic
++     linux-modules-extra-6.8.0-111-generic
+      lshw
+      lvm2
+      mstflint
+diff --git a/pxe/mkosi.profiles/scout-loader-x86_64/mkosi.conf b/pxe/mkosi.profiles/scout-loader-x86_64/mkosi.conf
+index 90422d580..4c8515c16 100644
+--- a/pxe/mkosi.profiles/scout-loader-x86_64/mkosi.conf
++++ b/pxe/mkosi.profiles/scout-loader-x86_64/mkosi.conf
+@@ -25,6 +25,7 @@ Packages=
+          iproute2
+          kmod
+          linux-image-6.8.0-111-generic
++         linux-modules-extra-6.8.0-111-generic
+          net-tools
+          netbase
+          procps
+
+base-commit: b506da56ffcd32fb662c796d3f02ea2f0c6d374f
+-- 
+2.47.3
+
